@@ -1,0 +1,2866 @@
+#!/bin/sh
+#
+############################################################################
+## lssecfixes - a script that reads a database of security fixes,
+## determines which fixes are required on the machine the script is
+## run on and reports accordingly
+##
+## DEPENDENCIES: (All files required to run the script)
+## ./lssecfixes.cfg
+## ./secfixdb.$Config{ 'osname' }
+##
+############################################################################
+
+LSSECFIXES_VERSION=1.9.5
+export LSSECFIXES_VERSION
+
+unset PERL5
+
+if [ x`echo $* | grep -- '--version'` != x ]
+then
+  echo $LSSECFIXES_VERSION
+  exit 255
+fi
+
+BASEDIR=`dirname $0`
+PGM=`basename $0`
+PATH=/usr/opt/perl5/bin:/opt/perl/bin:/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin
+
+for dir in `echo $PATH | tr ':' ' '`
+do
+  if [ -x $dir/perl ]
+  then
+    if $dir/perl -e 'print $]' | head -1 | grep '^5' >/dev/null 2>&1
+    then
+      PERL5=$dir/perl
+      export PERL5
+      exec $dir/perl -w -x $0 $@
+    fi
+  fi
+done
+
+echo "Perl 5 is required to run $0" 1>&2
+exit 255
+
+#!perl
+#line 47
+
+## epoch2readable: return human readable given epoch seconds
+#
+sub epoch2readable
+  {
+  return "-" if ( $_[0] == 0 || $_[0] == 2147483647 );
+  return strftime( $DATE_FORMAT, 0 ) if ( $_[0] < 0 );
+  return strftime( $DATE_FORMAT, localtime( $_[0] ) );
+  }
+
+## getSecurityClass: determine security class of the system
+#
+sub getSecurityClass
+  {
+  my( $securityClass ) = "";
+
+  if ( ! -e $envFile || ! open( INFILE, $envFile ) )
+    {
+    warn( "# Could not open $envFile to get security class.\n",
+          "# Assuming 'other'. If otherwise, please specify explicitly with -s option...\n" );
+
+    return "other";
+    }
+
+  while( <INFILE> )
+    {
+    s/^\s+|\s+$//g;
+
+    if ( /^server:/ )
+      {
+      my( $serverType ) = (split( ':' ))[1];
+      $serverType =~ s/\s//g;
+
+      if ( $serverType ne "prod" )
+        {
+        if ( $serverType =~ /^(test|unsup)$/ )
+          {
+          $securityClass = "non-prod";
+          last;
+          }
+        else
+          {
+          warn( "# Invalid server type specified in $envFile: \"$serverType\"\n" );
+          }
+        }
+      }
+    elsif ( /^build:/ )
+      {
+      my( $buildType ) = (split( ':' ))[1];
+
+      if ( $buildType =~ /^(office|mixed)$/ )
+        {
+        $securityClass = "non-prod";
+        last;
+        }
+      }
+    elsif ( /^security_class:/ )
+      {
+      $securityClass = (split( ':' ))[1];
+      }
+    }
+
+  close( INFILE );
+
+  if ( ! $securityClass )
+    {
+    warn( "# Could not determine security class.\n",
+          "# Assuming 'other'. If otherwise, please specify explicitly with -s option...\n" );
+
+    return "other";
+    }
+
+  return lc( $securityClass );
+  }
+
+## printInfo: print description of specified security fix
+#
+sub printInfo
+  {
+  my( $fixid, $fieldList, @fields );
+
+  ( $fixid, @fields ) = split( /:/, $opts{ 'i' } );
+  $fixid = join( ':', $fixid, shift( @fields ) ) if ( $fixid =~ /^\d+$/ );
+  $fieldList = shift( @fields );
+
+  @fields = ( qw( version description severity publishDate ) ) if ( ! defined( $fieldList ) );
+  @fields = split( /,/, $fieldList ) if ( defined( $fieldList ) );
+
+  for ( @fields )
+    {
+    next if ( ! exists( $securityFix{ $fixid } ) );
+    next if ( ! exists( $securityFix{ $fixid }{ $_ } ) );
+
+    printf( "%-7s = ", $_, ) if ( ! exists( $opts { 'H' } ) );
+
+    if ( /^publishDate$/ )
+      {
+      printf( "%s (%s)\n", $securityFix{ $fixid }{ $_ }, &epoch2readable( $securityFix{ $fixid }{ $_ } ) );
+      }
+    else
+      {
+      printf( "%s\n", $securityFix{ $fixid }{ $_ } );
+      }
+    }
+  }
+
+## sortFixes: perform sorts on the fixes according to what the user
+##   has specified in the -o option
+#
+sub sortFixes
+  {
+  my( $hashRef ) = @_;
+  my( @fixKeys, @possibleSortKeys, @sortMethod, @sortArgs );
+
+  @possibleSortKeys = ( 'PublishDate', 'ImplementationDate', 'Severity', 'Description', 'FixID' );
+
+  @fixKeys = keys %$hashRef;
+
+  @sortArgs = ();
+  @sortArgs = split( /,/, $opts{ 'o' } )
+    if ( exists( $opts{ 'o' } ) );
+
+  foreach my $sortArg ( @sortArgs )
+    {
+    @sortMethod = grep(/^$sortArg/i, @possibleSortKeys );
+    if ( scalar( @sortMethod ) != 1 )
+      {
+      warn( "# Sort key \"$sortArg\" is ambiguous or invalid...\n" );
+      next;
+      }
+
+    if ( ! defined &{ "sortFixesBy" . $sortMethod[0] } )
+      {
+      warn( "# Cannot sort by \"$sortMethod[0]\".  Invalid sort key...\n" );
+      next;
+      }
+
+    @fixKeys = &{ "sortFixesBy" . $sortMethod[0] }( $hashRef, @fixKeys );
+    }
+
+  if ( scalar( @sortArgs == 0 ) )
+    {
+    @fixKeys =
+      sortFixesBySeverity( $hashRef,
+                           sortFixesByImplementationDate( $hashRef, @fixKeys ) );
+    }
+
+  return @fixKeys;
+  }
+
+## sortFixesByDescription: sort fixes by description, alphabetically 
+##   and return an ordered list of security fix #'s
+#
+sub sortFixesByDescription
+  {
+  my ($hashRef, @fixKeys) = @_;
+
+  return sort { $$hashRef{ $a }{ 'description' } cmp
+                $$hashRef{ $b }{ 'description' } } @fixKeys;
+  }
+
+## sortFixesBySeverity: sort fixes by severity (highest to lowest)
+##   and return an ordered list of security fix #'s
+#
+sub sortFixesBySeverity
+  {
+  my( $hashRef, @fixKeys ) = @_;
+  my( @highSev, @medSev, @lowSev, @noSev, @allSev );
+
+  foreach my $fixKey ( @fixKeys )
+    {
+    if ( $$hashRef{ $fixKey }{ 'severity' } eq "H" )
+      { push @highSev, $fixKey; next; }
+    elsif ( $$hashRef{ $fixKey }{ 'severity' } eq "M" )
+      { push @medSev, $fixKey; next; }
+    elsif ( $$hashRef{ $fixKey }{ 'severity' } eq "L" )
+      { push @lowSev, $fixKey; next; }
+    elsif ( $$hashRef{ $fixKey }{ 'severity' } eq "N" )
+      { push @noSev, $fixKey; next; }
+    }
+
+  push @allSev, @highSev, @medSev, @lowSev, @noSev;
+
+  return @allSev;
+  }
+
+## sortFixesByImplementationDate: sort fixes by implementation date and
+##   return an ordered list of security fix #'s 
+#
+sub sortFixesByImplementationDate
+  {
+  my ($hashRef, @fixKeys) = @_;
+
+  return sort { $$hashRef{ $a }{ 'implementationDate' } <=>
+                $$hashRef{ $b }{ 'implementationDate' } } @fixKeys;
+  }
+
+## sortFixesByPublishDate: sort fixes by publish date and return an
+##   ordered list of security fix #'s 
+#
+sub sortFixesByPublishDate
+  {
+  my ($hashRef, @fixKeys) = @_;
+
+  return sort { $$hashRef{ $a }{ 'publishDate' } <=>
+                $$hashRef{ $b }{ 'publishDate' } } @fixKeys;
+  }
+
+## sortFixesByFixID: sort fixes by fix ID and return an
+##   ordered list of security fix #'s 
+#
+sub sortFixesByFixID
+  {
+  my ($hashRef, @fixKeys) = @_;
+
+  return sort( @fixKeys );
+  }
+
+## usage: print the usage of the command and exit
+#    
+sub usage
+  {
+  print STDERR "Usage: $0\n",
+               "          [-a] [-c <cfg_file>] [-D <ftp_dir>] [-d <dir>] [-E] [-e] [-f]\n",
+               "          [-H] [-I] [-i <fixid>:<version,description,severity,publishDate>]\n",
+               "          [-o [Sev|Imp|Pub]] [-P <ftp_passwd>] [-p] [-S <ftp_server>] [-s <security_class>]\n",
+               "          [-t <delimiter>] [-T <date_format> ] [-U <ftp_user>] [-V] [-v <version>] [-x]\n\n",
+               "   -a        Displays all security fixes regardless of\n",
+               "             whether they need to be installed.\n",
+               "   -c        Specify a system config file other than\n",
+               "             /.ws/config/env or /etc/env.cfg.\n",
+               "   -D        Specifies the directory of the security fix DB on the FTP server.\n",
+               "   -d        Specifies the config file directory.\n",
+               "   -E        Disable e-fix checking.\n",
+               "   -e        Report on e-fixes only.\n",
+               "   -f        Prepend a column to the report that displays the fix DB that is being referenced.\n",
+               "   -F        Display the security fix DB, fix DB size and modification time before reporting.\n",
+               "   -H        Do not print header line.\n",
+               "   -I        Print a list of installed security fixes and install dates.\n",
+               "   -i        Prints information about the specified security fix.\n",
+               "             Specify the security fix number, and a comma-delimited\n",
+               "             list of the attributes to report, separated by\n",
+               "             a colon.\n",
+               "   -n        Display the advisory number rather than the APAR number (only applicable to AIX).\n",
+               "   -o        The sort order should be specified by one or\n",
+               "             more of the field names, separated by commas\n",
+               "             or spaces. If no field names are given, the\n",
+               "             command uses the default sort order.\n",
+               "   -P        Specifies the password to use on the FTP server.\n",
+               "   -p        Displays the affected filesets for any security fix\n",
+               "             that need to be installed (only in default\n",
+               "             output mode).\n",
+               "   -S        Specifies the hostname of the FTP server from which to retrieve the\n",
+               "             required security fix database file.\n",
+               "   -s        Specifies the system's security class (only\n",
+               "             needed if not in /.ws/config/env).\n",
+               "   -T        Specifies an alternate date format to use in the report output.\n",
+               "             Default is '%m/%d/%Y'.\n",
+               "   -t        Specifies a delimiter character to separate\n",
+               "             columns with.\n",
+               "   -U        Specifies the user to login as on the FTP server.\n",
+               "   -v        Specify an OS version to report (other than the\n",
+               "             level of the current system).\n",
+               "   -x        Turns off the extended check.\n\n",
+               "DUE DATE EXPLANATION:\n",
+               "   \'*\' = Security fix is overdue.\n",
+               "   \'+\' = Security fix is overdue and has a revision\n",
+               "         level higher than the current system.\n",
+               "         (e.g. 4.3.2.x -> 4.3.3.x)\n",
+               "   \'-\' = Security fix is not yet due, but has a higher\n",
+               "         revision level than the current system.\n",
+               "   \' \' = Security fix is not yet due.\n",
+               "   \'I\' = Security fix has already been installed.\n",
+               "   \'E\' = Equivalent e-fix has been applied.\n",
+               "   \'W\' = Workaround has been implemented or affected service not running.\n",
+               "  \'NA\' = Security fix does not apply.\n",
+               "   \'F\' = Security fix has not been released (future).\n",
+               "   \'A\' = Security fix has been released, but not formally announced.\n\n";
+  exit( 255 );
+  }
+
+## cmpFilesetLevel: compare two fileset levels and return accordingly
+#
+sub cmpFilesetLevel
+  {
+  my ( $f1, $f2 ) = @_;
+  my ( @a ) = split( /\./, $f1 );
+  my ( @b ) = split( /\./, $f2 );
+  my ( $index ) = (sort( $#a, $#b ))[-1];
+
+  for( $i = 0 ; $i <= $index ; $i++ )
+    {
+    return  1 if ( $i > $#b );
+    return -1 if ( $i > $#a );
+
+    if ( $a[$i] =~ /^[0-9]*$/ && $b[$i] =~ /^[0-9]*$/ )
+      {
+      return  1 if ( $a[$i] > $b[$i] );
+      return -1 if ( $a[$i] < $b[$i] );
+      }
+    else
+      {
+      return  1 if ( ( $a[$i] cmp $b[$i] ) > 0 );
+      return -1 if ( ( $a[$i] cmp $b[$i] ) < 0 );
+      }
+    }
+
+  return 0 ;
+  }
+
+## splitRPMParts: split RPM version component into parts
+#
+sub splitRPMParts
+  {
+  my( $part ) = @_;
+  my( @parts, $char, $charType, $prevCharType, $buffer );
+
+  @parts = ();
+  $char = "";
+  $charType = "";
+  $prevCharType = "";
+  $buffer = "";
+
+  foreach $char ( split( //, $part ) )
+    {
+    $prevCharType = $charType;
+
+    if ( $char =~ /[_]/ )
+      {
+      $charType = "separator";
+      next;
+      }
+
+    if ( $char =~ /[0-9]/ )
+      {
+      $charType = "numeric";
+      }
+    else
+      {
+      $charType = "alphabetic";
+      }
+
+    if ( $charType && $prevCharType && $charType ne $prevCharType )
+      {
+      push( @parts, $buffer );
+      $buffer  = "";
+      }
+
+    $buffer .= $char;
+    }
+
+  push( @parts, $buffer );
+
+  return @parts;
+  }
+
+## cmpRPMPart: compare an RPM version component
+#
+sub cmpRPMPart
+  {
+  my( $level1Part, $level2Part ) = @_;
+
+  if ( $level1Part =~ /^[0-9]+$/ )
+    {
+    if ( $level2Part =~ /^[0-9]+$/ )
+      {
+      return -1
+        if ( $level1Part > $level2Part );
+      return 1
+        if ( $level1Part < $level2Part );
+      }
+    else
+      {
+      return -1;
+      }
+    }
+  else
+    {
+    if ( $level2Part =~ /^[0-9]+$/ )
+      {
+      return 1;
+      }
+    else
+      {
+      return -1
+         if ( ( $level1Part cmp $level2Part ) > 0 );
+      return 1
+         if ( ( $level1Part cmp $level2Part ) < 0 );
+      }
+    }
+
+  return 0;
+  }
+
+## cmpRPMLevel: compare two RPM levels
+#
+sub cmpRPMLevel
+  {
+  my( $level1, $level2 ) = @_;
+  my( $level1Version, $level1Release, $level2Version, $level2Release, $part );
+  my( @level1VersionArray, @level1ReleaseArray, @level2VersionArray, @level2ReleaseArray, $x, $comparison );
+
+  @level1VersionArray = ();
+  @level1ReleaseArray = ();
+  @level2VersionArray = ();
+  @level2ReleaseArray = ();
+
+  ( $level1Version, $level1Release ) = split( /\-/, $level1 );
+  ( $level2Version, $level2Release ) = split( /\-/, $level2 );
+
+  foreach $part ( split( /\./, $level1Version ) )
+    {
+    push( @level1VersionArray, &splitRPMParts( $part ) );
+    }
+
+  foreach $part ( split( /\./, $level2Version ) )
+    {
+    push( @level2VersionArray, &splitRPMParts( $part ) );
+    }
+
+  $x = 0;
+  while ( $x < scalar( @level1VersionArray ) )
+    {
+    return -1 if ( ! defined( $level2VersionArray[$x] ) );
+
+    $comparison = &cmpRPMPart( $level1VersionArray[$x], $level2VersionArray[$x] );
+
+    return $comparison if ( $comparison != 0 );
+
+    $x++;
+    }
+
+  return 1 if ( defined( $level2VersionArray[$x] ) );
+
+  foreach $part ( split( /\./, $level1Release ) )
+    {
+    push( @level1ReleaseArray, &splitRPMParts( $part ) );
+    }
+
+  foreach $part ( split( /\./, $level2Release ) )
+    {
+    push( @level2ReleaseArray, &splitRPMParts( $part ) );
+    }
+
+  $x = 0;
+  while ( $x < scalar( @level1ReleaseArray ) )
+    {
+    return -1 if ( ! defined( $level2ReleaseArray[$x] ) );
+
+    $comparison = &cmpRPMPart( $level1ReleaseArray[$x], $level2ReleaseArray[$x] );
+    return $comparison if ( $comparison != 0 );
+
+    $x++;
+    }
+
+  return 1 if ( defined( $level2ReleaseArray[$x] ) );
+
+  return 0;
+  }
+
+## cmpDebLevel: compare two Deb levels
+#
+sub cmpDebLevel
+  {
+  my ( $level1, $level2 ) = @_;
+
+  system( "$COMMANDS{ 'dpkg' } --compare-versions $level1 gt $level2" );
+  my $rc = $? >> 8;
+
+  # dpkg --compare-versions returns 0 if $level1 is newer, otherwise 1; we want -1 if $level1 is newer, otherwise 0
+  return ( $rc == 0 ) ? -1 : 0;
+  }
+
+## cmpPkgLevel: Generic version comparison function
+#
+sub cmpPkgLevel
+  {
+  if ( defined( $linux_dist ) && $linux_dist =~ m/Debian|Ubuntu/ )
+    {
+    return cmpDebLevel( @_ );
+    }
+
+  return cmpRPMLevel( @_ );
+  }
+
+## getInstalledSoftware_linux: get info on installed software using rpm -qa
+#
+sub getInstalledSoftware_linux
+  {
+  %installedSoftware = ();
+
+  if ( $linux_dist eq "Debian" || $linux_dist eq "Ubuntu" )
+    {
+    my( $installTime, $deb, $version, $desc );
+
+    $ENV{'COLUMNS'} = 200;
+
+    if ( ! open( DPKG_Q, "$COMMANDS{ 'dpkg' } -l 2>/dev/null |" ) )
+      {
+      die( "$COMMANDS{ 'dpkg' } -l failed" );
+      }
+
+    while ( <DPKG_Q> )
+      {
+      chomp();
+      ( $status, $deb, $version, $desc ) = split();
+
+      next if ( $status !~ /^[uirph][^nc]$/i );
+
+      $installedSoftware{ $deb }{ 'version' } = $version;
+      $installedSoftware{ $deb }{ 'installTime' } = (stat("/var/lib/dpkg/info/$deb.list"))[9];
+      }
+
+    close( DPKG_Q );
+    }
+  else
+    {
+    my( $installTime, $rpm, $version, $release );
+
+    if ( ! open( RPM_Q, "$COMMANDS{ 'rpm' } -qa --qf '%{INSTALLTIME}~%{NAME}~%{VERSION}-%{RELEASE}\n' 2>/dev/null |" ) )
+      {
+      die( "$COMMANDS{ 'rpm' } -qa failed" );
+      }
+
+    while ( <RPM_Q> )
+      {
+      chomp();
+      ( $installTime, $rpm, $version ) = split( /~/ );
+
+      if ( ! exists( $installedSoftware{ $rpm }{ 'installTime' } ) ||
+           $installedSoftware{ $rpm }{ 'installTime' } < $installTime )
+        {
+        $installedSoftware{ $rpm }{ 'version' } = $version;
+        $installedSoftware{ $rpm }{ 'installTime' } = $installTime;
+        }
+      }
+
+    close( RPM_Q ) ;
+    }
+  }
+
+## readFixDB_linux: open fix database and read in data
+#
+sub readFixDB_linux
+  {
+  %securityFix = ();
+
+  open( FIXDB, "$fixDB" ) || die( "Could not open $fixDB: $!\n" );
+
+  while ( <FIXDB> )
+    {
+    chomp();
+
+    my( @fields );
+    @fields = split( ":::" );
+
+    my( $rowType ) = shift( @fields );
+    next if ( ! defined( $rowType ) );
+
+    if ( $rowType eq "advisory" )
+      {
+      $securityFix{ $fields[0] }{ 'publishDate' } = $fields[1];
+      $securityFix{ $fields[0] }{ 'severity' } = $fields[2];
+      $securityFix{ $fields[0] }{ 'description' } = $fields[3];
+      $securityFix{ $fields[0] }{ 'extendedCheck' } = $fields[4] if ( $fields[4] );
+
+      $securityFix{ $fields[0] }{ 'implementationDate' } = 
+        $securityFix{ $fields[0] }{ 'publishDate' } +
+          $SYSTEM_TYPE{ $securityClass }{ 'schedule' }{ $fields[2] };
+
+      $securityFix{ $fields[0] }{ 'installationStatus' } = "NA"
+        if ( ! $SYSTEM_TYPE{ $securityClass }{ 'schedule' }{ $fields[2] } );
+      }
+    elsif ( $rowType eq "package" )
+      {
+      $securityFix{ $fields[0] }{ 'rpms' }{ $fields[1] }{ 'version' } = $fields[2];
+      $securityFix{ $fields[0] }{ 'rpms' }{ $fields[1] }{ 'minVersion' } = $fields[3] if ( $fields[3] );
+      }
+    }
+
+  close( FIXDB );
+  }
+
+## checkInstallationStatus_linux: check the installation status of security fixes
+#
+sub checkInstallationStatus_linux
+  {
+  my( $kernelLevel ) = `uname -r`;
+  chomp( $kernelLevel );
+
+  if ( $kernelLevel =~ /\.legacy/ )
+    {
+    $kernelLevel =~ s/(legacy)[a-wy-z]*$/$1/;
+    }
+  else
+    {
+    $kernelLevel =~ s/[a-wy-z]*$//;
+    }
+
+  ADVISORY:
+  foreach my $advisory ( keys( %securityFix ) )
+    {
+    next ADVISORY if ( exists( $securityFix{ $advisory }{ 'installationStatus' } ) &&
+              $securityFix{ $advisory }{ 'installationStatus' } eq "NA" );
+
+    foreach my $rpm ( keys( %{ $securityFix{ $advisory }{ 'rpms' } } ) )
+      {
+      if ( exists( $installedSoftware{ $rpm } ) )
+        {
+        $installedSoftware{ $rpm }{ 'version' } = $kernelLevel if ( $rpm =~ /^(kernel|kernel-.*)$/ && $linux_dist ne "Debian" );
+
+        if ( exists( $securityFix{ $advisory }{ 'rpms' }{ $rpm }{ 'minVersion' } ) &&
+            &cmpPkgLevel( $securityFix{ $advisory }{ 'rpms' }{ $rpm }{ 'minVersion' },
+                          $installedSoftware{ $rpm }{ 'version' } ) < 0 )
+          {
+          $securityFix{ $advisory }{ 'rpms' }{ $rpm }{ 'status' } = "NA";
+          $securityFix{ $advisory }{ 'installationStatus' } = "NA";
+          }
+        elsif ( &cmpPkgLevel( $securityFix{ $advisory }{ 'rpms' }{ $rpm }{ 'version' },
+                              $installedSoftware{ $rpm }{ 'version' } ) < 0 )
+          {
+          $securityFix{ $advisory }{ 'rpms' }{ $rpm }{ 'status' } = "<";
+          $securityFix{ $advisory }{ 'installationStatus' } = "N";
+
+          if ( ( ! exists( $opts{ 'x' } ) ) && exists( $securityFix{ $advisory }{ 'extendedCheck' } ) &&
+               &runExtendedCheck( $securityFix{ $advisory }{ 'extendedCheck' } ) != 0 )
+            {
+            $securityFix{ $advisory }{ 'installationStatus' } = "W";
+            }
+
+          next ADVISORY;
+          }
+        else
+          {
+          $securityFix{ $advisory }{ 'rpms' }{ $rpm }{ 'status' } = ">=";
+          $securityFix{ $advisory }{ 'installationStatus' } = "Y";
+
+          if ( ! exists( $securityFix{ $advisory }{ 'installTime' } ) ||
+               $securityFix{ $advisory }{ 'installTime' } < $installedSoftware{ $rpm }{ 'installTime' } )
+            {
+            $securityFix{ $advisory }{ 'installTime' } = $installedSoftware{ $rpm }{ 'installTime' };
+            }
+          }
+        }
+      }
+
+    $securityFix{ $advisory }{ 'installationStatus' } = "NA"
+      if ( ! $securityFix{ $advisory }{ 'installationStatus' } );
+    }
+  }
+
+
+## report_linux: report on advisories that need to be installed
+#
+sub report_linux
+  {
+  my( $printFormat );
+
+  if ( exists( $opts{ 'I' } ) )
+    {
+    $printFormat = ( exists( $opts{ 't' } ) ) ?
+       join( $opts{ 't' }, "%s", "%s", "%s\n" ) :
+         "%-20s %-20s %-20s\n";
+    }
+  else
+    {
+    $printFormat = ( exists( $opts{ 't' } ) ) ?
+       join( $opts{ 't' }, "%s", "%s", "%s", "%s", "%s\n" ) :
+         "%-10s  %-3s  %-3s  %-11s  %-s\n";
+    }
+
+  @fixList = &sortFixes( \%securityFix );
+
+  if ( exists( $opts{ 'F' } ) )
+    {
+    my( @fixDBStats );
+    @fixDBStats = stat( $fixDB );
+    print( STDERR "# fixDB = $fixDB, $fixDBStats[7], " . localtime( $fixDBStats[9] ) . "\n" );
+    }
+
+  if ( exists( $opts{ 'C' } ) )
+    {
+    print( STDERR "# securityClass = $securityClass\n" );
+    }
+
+  if ( ! exists( $opts{ 'H' } ) )
+    {
+    if ( exists( $opts{ 'I' } ) )
+      {
+      printf( $printFormat, "ADVISORY", "VENDOR_ADVISORY", "INSTALL_DATE" );
+      printf( $printFormat, "-" x 20, "-" x 20, "-" x 20 ) if ( ! exists( $opts{ 't' } ) );
+      }
+    else
+      {
+      printf( ( exists( $opts{ 't' } ) ) ? "%s" . $opts{ 't' } : "%-23s  ", "FIX DB" )
+        if ( exists( $opts{ 'f' } ) );
+      printf( $printFormat, "DUE DATE", "DUE", "SEV", "ADVISORY", "DESCRIPTION" );
+
+      printf( "%-23s  ", "-" x 23 )
+        if ( exists( $opts{ 'f' } ) && ! exists( $opts{ 't' } ) );
+      printf( $printFormat, "-" x 10, "-" x 3, "-" x 3, "-" x 11 , "-" x 45 ) if ( ! exists( $opts{ 't' } ) );
+      }
+    }
+
+  foreach my $advisory ( @fixList )
+    {
+    my( $dueChar ) = " ";
+    my( $vendor_advisory );
+
+    $dueChar = "*" if ( $securityFix{ $advisory }{ 'implementationDate' } <= $^T );
+    $dueChar = "F" if ( $securityFix{ $advisory }{ 'publishDate' } > $^T );
+    $dueChar = "I" if ( $securityFix{ $advisory }{ 'installationStatus' } eq "Y" );
+    $dueChar = "NA" if ( $securityFix{ $advisory }{ 'installationStatus' } eq "NA" );
+    $dueChar = "W" if ( $securityFix{ $advisory }{ 'installationStatus' } eq "W" );
+
+    next if ( ! exists( $opts{ 'a' } ) && ! exists( $opts{ 'I' } ) && $dueChar =~ /^(I|NA|W)$/ );
+
+    $securityFix{ $advisory }{ 'description' } =~ s/\Q$opts{ 't' }\E/\\$opts{ 't' }/g
+      if ( exists( $opts{ 't' } ) );
+
+    if ( exists( $opts{ 'r' } ) )
+      {
+      print( "$advisory\n" );
+      }
+    elsif ( exists( $opts{ 'I' } ) )
+      {
+      if ( $securityFix{ $advisory }{ 'description' } =~ /^(RHSA|FLSA)/ )
+        {
+        ( $vendor_advisory = (split( ' ', $securityFix{ $advisory }{ 'description' } ))[0] ) =~ s/:$//;
+        } 
+      else
+        {
+        $vendor_advisory = "N/A";
+        }
+
+      if ( $dueChar eq "I" ) 
+        { 
+        printf( $printFormat,
+                $advisory, 
+                $vendor_advisory, 
+                ( exists( $securityFix{ $advisory }{ 'installTime' } ) ) ?
+                  &epoch2readable( $securityFix{ $advisory }{ 'installTime' } ) :
+                    "??/??/????" 
+              ); 
+        } 
+      elsif ( $dueChar =~ /^(NA|W)$/ ) 
+        { 
+        printf( $printFormat,
+                $advisory, 
+                $vendor_advisory, 
+                "99/99/9999" 
+              ); 
+        } 
+      }
+    else
+      {
+      printf( ( exists( $opts{ 't' } ) ) ? "%s" . $opts{ 't' } : "%-23s  ", "$fixDBShort" )
+        if ( exists( $opts{ 'f' } ) );
+
+      printf( $printFormat,
+              &epoch2readable( $securityFix{ $advisory }{ 'implementationDate' } ),
+              $dueChar,
+              $securityFix{ $advisory }{ 'severity' },
+              $advisory,
+              $securityFix{ $advisory }{ 'description' } );
+
+      if ( exists( $opts{ 'p' } ) )
+        {
+        foreach my $rpm ( sort( keys( %{ $securityFix{ $advisory }{ 'rpms' } } ) ) )
+          {
+          if ( ! exists( $securityFix{ $advisory }{ 'rpms' }{ $rpm }{ 'status' } ) &&
+               exists( $installedSoftware{ $rpm } ) )
+            {
+            if ( &cmpPkgLevel( $securityFix{ $advisory }{ 'rpms' }{ $rpm }{ 'version' },
+                               $installedSoftware{ $rpm }{ 'version' } ) < 0 )
+              {
+              $securityFix{ $advisory }{ 'rpms' }{ $rpm }{ 'status' } = "<";
+              }
+            else
+              {
+              $securityFix{ $advisory }{ 'rpms' }{ $rpm }{ 'status' } = ">=";
+              }
+            }
+
+          printf( "  %-30s %-20s %-2s %-20s\n", $rpm,
+                  ( exists( $installedSoftware{ $rpm } ) ) ?
+                    $installedSoftware{ $rpm }{ 'version' } :
+                      "N/A",
+                  ( exists( $securityFix{ $advisory }{ 'rpms' }{ $rpm }{ 'status' } ) ) ?
+                    $securityFix{ $advisory }{ 'rpms' }{ $rpm }{ 'status' } :
+                      "",
+                  $securityFix{ $advisory }{ 'rpms' }{ $rpm }{ 'version' } );
+          }
+        }
+      }
+    }
+  }
+
+## getFilesetHistory: gather fileset history information for use with -I option
+#
+sub getFilesetHistory
+  {
+  my( @lpps, %attr, $arg, $val, $vrml );
+
+  local( $ENV{ 'ODMDIR' } ) = "/usr/lib/objrepos";
+
+  @lpps = ();
+  %attr = ();
+
+  open( ODMGET, "$COMMANDS{'odmget'} lpp |" );
+
+  while ( <ODMGET> )
+    {
+    $_ =~ s/^\s+|\s+$//g;
+
+    if ( /^(lpp_id|name)\s*=/ )
+      {
+      ( $arg, $val ) = split( /\s*=\s*/ );
+      $attr{ $arg } = $val;
+      }
+    elsif ( /^lpp:/ )
+      {
+      if ( $attr{ 'lpp_id' } && $attr{ 'name' } )
+        {
+        $attr{ 'name' } =~ s/"//g;
+        $lpps[ $attr{ 'lpp_id' } ] = $attr{ 'name' };
+        %attr = ();
+        }
+      }
+    }
+
+  close( ODMGET );
+
+  $lpps[ $attr{ 'lpp_id' } ] = $attr{ 'name' };
+
+  open( ODMGET, "$COMMANDS{'odmget'} history |" );
+
+  while ( <ODMGET> )
+    {
+    $_ =~ s/^\s+|\s+$//g;
+
+    if ( /^(lpp_id|event|time|ver|rel|mod|fix)\s*=/ )
+      {
+      ( $arg, $val ) = split( /\s*=\s*/ );
+      $attr{ $arg } = $val;
+      }
+    elsif ( /^history:/ )
+      {
+      if ( $attr{ 'lpp_id' } && $attr{ 'time' } )
+        {
+        if ( $lpps[ $attr{ 'lpp_id' } ] )
+          {
+          $vrml = join( '.', $attr{ 'ver' }, $attr{ 'rel' }, $attr{ 'mod' }, $attr{ 'fix' } );
+
+          if ( ! exists( $installedSoftware{ $lpps[ $attr{ 'lpp_id' } ] }{ 'history' }{ $vrml } ) ||
+               $installedSoftware{ $lpps[ $attr{ 'lpp_id' } ] }{ 'history' }{ $vrml } > $attr{ 'time' } )
+            {
+            $installedSoftware{ $lpps[ $attr{ 'lpp_id' } ] }{ 'history' }{ $vrml } = $attr{ 'time' };
+            }
+          }
+
+        %attr = ();
+        }
+      }
+    }
+
+  close( ODMGET );
+
+  if ( $attr{ 'lpp_id' } && $attr{ 'time' } && $attr{ 'event' } == 1 && $lpps[ $attr{ 'lpp_id' } ] )
+    {
+    $vrml = join( '.', $attr{ 'ver' }, $attr{ 'rel' }, $attr{ 'mod' }, $attr{ 'fix' } );
+
+    if ( ! exists( $installedSoftware{ $lpps[ $attr{ 'lpp_id' } ] }{ 'history' }{ $vrml } ) ||
+         $installedSoftware{ $lpps[ $attr{ 'lpp_id' } ] }{ 'history' }{ $vrml } > $attr{ 'time' } )
+      {
+      $installedSoftware{ $lpps[ $attr{ 'lpp_id' } ] }{ 'history' }{ $vrml } = $attr{ 'time' };
+      }
+    }
+  }
+
+## getInstalledSoftware_aix: get info on installed software using lslpp
+#
+sub getInstalledSoftware_aix
+  {
+  my( $fileset, $level, $action, $date, $time, @parts );
+
+  %installedSoftware = ();
+
+  if ( ! open( LSLPP, "$COMMANDS{ 'lslpp' } -Lcq 2>/dev/null |" ) )
+    {
+    die( "$COMMANDS{ lslpp } -Lcq failed" );
+    }
+
+  while ( <LSLPP> )
+    {
+    # WARNING: this is dependant on the output of lslpp -Lcq
+    my( $fileset, $level, $status, $type );
+    ( $fileset, $level, $status, $type ) = ( split( /:/ ) )[1,2,5,6];
+    next if ( $type =~ /^[ER]$/ );  # Ignore eFixes and RPMs
+    $installedSoftware{ $fileset }{ 'level' } = $level ;
+    $installedSoftware{ $fileset }{ 'status' } = $status ;
+    }
+
+  close( LSLPP ) ;
+
+  &getFilesetHistory() if ( exists( $opts{ 'I' } ) );
+  }
+
+## readFixDB_aix: open fix database and read in data
+#
+sub readFixDB_aix
+  {
+  %securityFix = ();
+  %advToAPAR = ();
+
+  open( FIXDB, "$fixDB" ) || die( "Could not open $fixDB: $!\n" );
+
+  while ( <FIXDB> )
+    {
+    chomp();
+
+    my( @fields ) = split( ":::" );
+    my( $rowType ) = shift( @fields );
+    next if ( ! defined( $rowType ) );
+
+    if ( $legacyFixDB && $rowType ne "secptf" )
+      {
+      my( $version ) = shift( @fields );
+      next if ( $version ne $REPORT_VERSION );
+      }
+
+    if ( $rowType eq "secptf" )
+      {
+      next if ( ! exists( $securityFix{ $fields[0] } ) );
+
+      $securityFix{ $fields[0] }{ 'ptfs' }{ $fields[1] }{ 'level' } = $fields[2];
+      $securityFix{ $fields[0] }{ 'ptfs' }{ $fields[1] }{ 'minLevel' } = $fields[3] if ( $fields[3] );
+      }
+    elsif ( $rowType eq "secapar" )
+      {
+      $securityFix{ $fields[0] }{ 'fixtype' } = "apar";
+      $securityFix{ $fields[0] }{ 'description' } = $fields[1];
+      $securityFix{ $fields[0] }{ 'severity' } = $fields[2];
+      $securityFix{ $fields[0] }{ 'publishDate' } = $fields[3];
+      $securityFix{ $fields[0] }{ 'extendedCheck' } = $fields[4] if ( $fields[4] );
+
+      if ( $fields[3] )
+        {
+        $securityFix{ $fields[0] }{ 'implementationDate' } = 
+          $fields[3] + $SYSTEM_TYPE{ $securityClass }{ 'schedule' }{ $fields[2] };
+        }
+      else
+        {
+        $securityFix{ $fields[0] }{ 'implementationDate' } = 2147483647;
+        }
+
+      $securityFix{ $fields[0] }{ 'installationStatus' } = "NA"
+        if ( ! $SYSTEM_TYPE{ $securityClass }{ 'schedule' }{ $fields[2] } );
+      }
+    elsif ( $rowType eq "efix" )
+      {
+      my( $advisory ) = (split( /-/, $fields[0] ))[-1];
+
+      $securityFix{ $advisory }{ 'fixtype' } = "efix";
+      $securityFix{ $advisory }{ 'description' } = $fields[1];
+      $securityFix{ $advisory }{ 'severity' } = $fields[2];
+      $securityFix{ $advisory }{ 'publishDate' } = $fields[3];
+      $securityFix{ $advisory }{ 'supercedingFix' } = $fields[4];
+      $securityFix{ $advisory }{ 'extendedCheck' } = $fields[5] if ( $fields[5] );
+
+      if ( $fields[3] )
+        {
+        $securityFix{ $advisory }{ 'implementationDate' } = 
+          $fields[3] + $SYSTEM_TYPE{ $securityClass }{ 'schedule' }{ $fields[2] };
+        }
+      else
+        {
+        $securityFix{ $advisory }{ 'implementationDate' } = 2147483647;
+        }
+
+      $securityFix{ $advisory }{ 'installationStatus' } = "NA"
+        if ( ! $SYSTEM_TYPE{ $securityClass }{ 'schedule' }{ $fields[2] } );
+      }
+    elsif ( $rowType eq "efixfile" )
+      {
+      my( $advisory ) = (split( /-/, $fields[0] ))[-1];
+
+      $securityFix{ $advisory }{ 'files' }{ $fields[1] }{ 'md5_efix' } = $fields[2];
+      }
+    elsif ( $rowType eq "emgr" )
+      {
+      my( $advisory ) = (split( /-/, $fields[0] ))[-1];
+
+      $securityFix{ $advisory }{ 'emgr' }{ 'vuid' } = $fields[1];
+      $securityFix{ $advisory }{ 'emgr' }{ 'fileset' } = $fields[2];
+      }
+    elsif ( $rowType eq "advisory" )
+      {
+      $securityFix{ $fields[1] }{ 'advisory' } = $fields[0];
+      push( @{ $advToAPAR{ $fields[0] } }, $fields[1] );
+      }
+    }
+  }
+
+## aparInstallTime: determine the installation time of a particular APAR
+#
+sub aparInstallTime
+  {
+  my( $fixid, $fileset, $level ) = @_;
+  my( $histLevel, $installTime );
+
+  $installTime = 0;
+
+  foreach $histLevel ( sort { &cmpFilesetLevel( $b, $a ) } keys( %{ $installedSoftware{ $fileset }{ 'history' } } ) )
+    {
+    if ( &cmpFilesetLevel( $histLevel, $level ) >= 0 )
+      {
+      $installTime = $installedSoftware{ $fileset }{ 'history' }{ $histLevel };
+      }
+    else
+      {
+      last;
+      }
+    }
+
+  if ( $installTime &&
+       ( ! exists( $securityFix{ $fixid }{ 'installTime' } ) ||
+         $securityFix{ $fixid }{ 'installTime' } < $installTime ) )
+    {
+    $securityFix{ $fixid }{ 'installTime' } = $installTime;
+    }
+  }
+
+## checkInstallationStatus_aix: check installation status of security fixes
+#
+sub checkInstallationStatus_aix
+  {
+  foreach my $fixtype ( qw( apar efix ) )
+    {
+    SECURITYFIX:
+    foreach my $fixid ( keys( %securityFix ) )
+      {
+      next SECURITYFIX if ( exists( $securityFix{ $fixid }{ 'installationStatus' } ) &&
+                            $securityFix{ $fixid }{ 'installationStatus' } eq "NA" );
+
+      next SECURITYFIX if ( $fixtype ne $securityFix{ $fixid }{ 'fixtype' } );
+
+      if ( $fixtype eq "efix" )
+        {
+        if ( exists( $securityFix{ $fixid }{ 'supercedingFix' } ) && $securityFix{ $fixid }{ 'supercedingFix' } )
+          {
+          SUPERFIX:
+          foreach my $supercedingFix ( split( /,/, $securityFix{ $fixid }{ 'supercedingFix' } ) )
+            {
+            if ( exists( $securityFix{ $supercedingFix } ) )
+              {
+              if ( $securityFix{ $supercedingFix }{ 'installationStatus' } eq "Y" )
+                {
+                $securityFix{ $fixid }{ 'installationStatus' } = "NA";
+                }
+              elsif ( $securityFix{ $supercedingFix }{ 'installationStatus' } eq "N" )
+                {
+                delete( $securityFix{ $fixid }{ 'installationStatus' } );
+                last SUPERFIX;
+                }
+              }
+            else
+              {
+              my( $instfixOutput ) = `$COMMANDS{ 'instfix' } -icqk $supercedingFix 2>/dev/null`;
+  
+              if ( $? == 0 && defined( $instfixOutput ) && $instfixOutput !~ /:-:/ )
+                {
+                $securityFix{ $fixid }{ 'installationStatus' } = "NA";
+                next SECURITYFIX;
+                }
+              }
+            }
+          }
+        }
+
+      next SECURITYFIX if ( exists( $securityFix{ $fixid }{ 'installationStatus' } ) &&
+                            $securityFix{ $fixid }{ 'installationStatus' } eq "NA" );
+
+      if ( $fixtype eq "apar" )
+        {
+        foreach my $ptf ( keys( %{ $securityFix{ $fixid }{ 'ptfs' } } ) )
+          {
+          if ( exists( $installedSoftware{ $ptf } ) )
+            {
+            if ( exists( $securityFix{ $fixid }{ 'ptfs' }{ $ptf }{ 'minLevel' } ) &&
+                 &cmpFilesetLevel( $installedSoftware{ $ptf }{ 'level' },
+                                   $securityFix{ $fixid }{ 'ptfs' }{ $ptf }{ 'minLevel' } ) < 0 )
+              {
+              $securityFix{ $fixid }{ 'installationStatus' } = "NA";
+              }
+            else
+              {
+              if ( &cmpFilesetLevel( $installedSoftware{ $ptf }{ 'level' },
+                                     $securityFix{ $fixid }{ 'ptfs' }{ $ptf }{ 'level' } ) < 0 )
+                {
+                $securityFix{ $fixid }{ 'installationStatus' } = "N";
+
+                if ( ( ! exists( $opts{ 'x' } ) ) && exists( $securityFix{ $fixid }{ 'extendedCheck' } ) &&
+                     &runExtendedCheck( $securityFix{ $fixid }{ 'extendedCheck' } ) != 0 )
+
+                  {
+                  $securityFix{ $fixid }{ 'installationStatus' } = "W";
+                  }
+
+                foreach my $peerAPAR ( @{ $advToAPAR{ $securityFix{ $fixid }{ 'advisory' } } } )
+                  {
+                  next if ( $peerAPAR eq $fixid );
+
+                  $securityFix{ $peerAPAR }{ 'installationStatus' } = "NA";
+                  }
+
+                next SECURITYFIX;
+                }
+              else
+                {
+                $securityFix{ $fixid }{ 'installationStatus' } = "Y";
+                &aparInstallTime( $fixid, $ptf, $securityFix{ $fixid }{ 'ptfs' }{ $ptf }{ 'level' } )
+                  if ( exists( $opts{ 'I' } ) );
+                }
+              }
+            }
+          }
+        }
+      elsif ( $fixtype eq "efix" && $efixChecking )
+        {
+        if ( exists( $securityFix{ $fixid }{ 'emgr' }{ 'vuid' } ) && $< == 0 && -x $COMMANDS{ 'emgr' } )
+          { 
+          if ( $securityFix{ $fixid }{ 'emgr' }{ 'fileset' } &&
+               ! exists( $installedSoftware{ $securityFix{ $fixid }{ 'emgr' }{ 'fileset' } } ) )
+            {
+            $securityFix{ $fixid }{ 'emgr' }{ 'state' } = "N/A";
+            $securityFix{ $fixid }{ 'installationStatus' } = "NA";
+            next SECURITYFIX;
+            }
+
+          $securityFix{ $fixid }{ 'emgr' }{ 'state' } = "";
+
+          for my $vuid ( split( /\|/, $securityFix{ $fixid }{ 'emgr' }{ 'vuid' } ) )
+            {
+            open( EMGR_OUTPUT, "$COMMANDS{ 'emgr' } -l -v 2 -u $vuid 2>&1 |" );
+
+            while ( <EMGR_OUTPUT> )
+              {
+              if ( /^STATE:\s+/ )
+                {
+                ( $securityFix{ $fixid }{ 'emgr' }{ 'state' } = (split( /:/ ))[1] ) =~ s/^\s+|\s+$//g;
+                }
+              elsif ( /^INSTALL DATE:\s+/ )
+                {
+                my( $date, $time, @parts );
+
+                ( $date, $time ) = (split( /\s+/ ))[2,3];
+                @parts = ( (split( ':', $time ))[2,1,0], (split( '/', $date ))[1,0,2] );
+                $parts[4]--;
+
+                $securityFix{ $fixid }{ 'installTime' } = timelocal( @parts );
+                }
+              }
+
+            close( EMGR_OUTPUT );
+
+            if ( $securityFix{ $fixid }{ 'emgr' }{ 'state' } =~ /^(STABLE|MOUNTED|REBOOT REQUIRED)$/ )
+              {
+              $securityFix{ $fixid }{ 'installationStatus' } = "Y";
+              }
+            else
+              {
+              $securityFix{ $fixid }{ 'installationStatus' } = "N";
+              }
+            }
+          }
+        else
+          {
+          EFIXFILE:
+          for my $file ( keys( %{ $securityFix{ $fixid }{ 'files' } } ) )
+            {
+            if ( ! -f "$file" )
+              {
+              $securityFix{ $fixid }{ 'files' }{ $file }{ 'md5_checksum' } = "N/A";
+              next EFIXFILE;
+              }
+            elsif ( ! -r "$file" )
+              {
+              $securityFix{ $fixid }{ 'files' }{ $file }{ 'md5_checksum' } = 0;
+              $securityFix{ $fixid }{ 'files' }{ $file }{ 'md5_matched' } = 0;
+              next EFIXFILE;
+              }
+
+            $securityFix{ $fixid }{ 'files' }{ $file }{ 'mtime' } = (stat( "$file" ))[9];
+
+            open( INFILE, "$file" );
+            binmode( INFILE );
+        
+            my( $md5 ) = Digest::MD5->new->addfile( *INFILE )->hexdigest;
+            $securityFix{ $fixid }{ 'files' }{ $file }{ 'md5_checksum' } = $md5;
+            $securityFix{ $fixid }{ 'files' }{ $file }{ 'md5_matched' } = 0;
+
+            close( INFILE );
+
+            EFIXMD5: 
+            foreach my $efix_md5 ( split( /\|/, $securityFix{ $fixid }{ 'files' }{ $file }{ 'md5_efix' } ) )
+              {
+              if ( $efix_md5 eq $md5 )
+                {
+                $securityFix{ $fixid }{ 'files' }{ $file }{ 'md5_matched' } = 1;
+                last EFIXMD5;
+                }
+              }
+            }
+
+          EFIXFILE:
+          for my $file ( keys( %{ $securityFix{ $fixid }{ 'files' } } ) )
+            {
+            if ( $securityFix{ $fixid }{ 'files' }{ $file }{ 'md5_checksum' } eq "N/A" )
+              {
+              $securityFix{ $fixid }{ 'installationStatus' } = "NA";
+              }
+            elsif ( ! $securityFix{ $fixid }{ 'files' }{ $file }{ 'md5_matched' } )
+              {
+              $securityFix{ $fixid }{ 'installationStatus' } = "N";
+              last EFIXFILE;
+              }
+            else
+              {
+              $securityFix{ $fixid }{ 'installationStatus' } = "Y";
+
+              $securityFix{ $fixid }{ 'installTime' } = $securityFix{ $fixid }{ 'files' }{ $file }{ 'mtime' }
+                if ( ! exists( $securityFix{ $fixid }{ 'installTime' } ) ||
+                     $securityFix{ $fixid }{ 'installTime' } < $securityFix{ $fixid }{ 'files' }{ $file }{ 'mtime' } );
+              }
+            }
+          }
+ 
+        if ( exists( $securityFix{ $fixid }{ 'supercedingFix' } ) && $securityFix{ $fixid }{ 'supercedingFix' } )
+          {
+          foreach my $supercedingFix ( split( /,/, $securityFix{ $fixid }{ 'supercedingFix' } ) )
+            {
+            if ( exists( $securityFix{ $supercedingFix } ) )
+              {
+              if ( $securityFix{ $fixid }{ 'installationStatus' } eq "Y" &&
+                   ! exists( $securityFix{ $supercedingFix }{ 'partialFix' } ) )
+                {
+                $securityFix{ $supercedingFix }{ 'installationStatus' } = "E";
+                $securityFix{ $supercedingFix }{ 'installTime' } = $securityFix{ $fixid }{ 'installTime' }
+                  if ( exists( $securityFix{ $fixid }{ 'installTime' } ) );
+                }
+              elsif ( $securityFix{ $fixid }{ 'installationStatus' } eq "N" &&
+                      $securityFix{ $supercedingFix }{ 'installationStatus' } eq "E" )
+                {
+                $securityFix{ $supercedingFix }{ 'installationStatus' } = "N";
+                $securityFix{ $supercedingFix }{ 'partialFix' } = "Y";
+                delete( $securityFix{ $supercedingFix }{ 'installTime' } );
+                }
+              }
+            }
+          }
+
+        if ( $securityFix{ $fixid }{ 'installationStatus' } eq "N" &&
+             ( ! exists( $opts{ 'x' } ) ) && exists( $securityFix{ $fixid }{ 'extendedCheck' } ) &&
+             &runExtendedCheck( $securityFix{ $fixid }{ 'extendedCheck' } ) != 0 )
+
+          {
+          $securityFix{ $fixid }{ 'installationStatus' } = "W";
+          }
+        }
+
+      $securityFix{ $fixid }{ 'installationStatus' } = "NA"
+        if ( ! $securityFix{ $fixid }{ 'installationStatus' } );
+      }
+    }
+  } 
+
+## report_aix: report on security fixes that need to be installed
+#
+sub report_aix
+  {
+  my( $printFormat );
+
+  if ( exists( $opts{ 'I' } ) )
+    {
+    $printFormat = ( exists( $opts{ 't' } ) ) ?
+      join( $opts{ 't' }, "%s", "%s", "%s", "%s\n" ) :
+        "%-14s %-14s %-14s %-s\n";
+    }
+  else
+    {
+    $printFormat = ( exists( $opts{ 't' } ) ) ?
+      join( $opts{ 't' }, "%s", "%s", "%s", "%s", "%s\n" ) :
+        "%-10s  %-3s  %-3s  %-11s  %-s\n";
+    }
+
+  my( @fixList, $fixid );
+
+  @fixList = &sortFixes( \%securityFix );
+
+  if ( exists( $opts{ 'F' } ) )
+    {
+    my( @fixDBStats );
+    @fixDBStats = stat( $fixDB );
+    print( STDERR "# fixDB = $fixDB, $fixDBStats[7], " . localtime( $fixDBStats[9] ) . "\n" );
+    }
+
+  if ( exists( $opts{ 'C' } ) )
+    {
+    print( STDERR "# securityClass = $securityClass\n" );
+    }
+
+  if ( ! exists( $opts{ 'H' } ) )
+    {
+    if ( exists( $opts{ 'I' } ) )
+      {
+      printf( $printFormat, "ADVISORY", "APAR/EFIX", "INSTALL_DATE", "DESCRIPTION" );
+      printf( $printFormat, "-" x 14, "-" x 14, "-" x 14, "-" x 35 ) if ( ! exists( $opts{ 't' } ) );
+      }
+    else
+      {
+      printf( ( exists( $opts{ 't' } ) ) ? "%s" . $opts{ 't' } : "%-23s  ", "FIX DB" )
+        if ( exists( $opts{ 'f' } ) );
+
+      printf( $printFormat, "DUE DATE", "DUE", "SEV", ( exists( $opts{ 'n' } ) ) ? "ADVISORY" : "APAR/EFIX", "DESCRIPTION" );
+
+      printf( "%-23s  ", "-" x 23 )
+        if ( exists( $opts{ 'f' } ) && ! exists( $opts{ 't' } ) );
+
+      printf( $printFormat, "-" x 10, "-" x 3, "-" x 3, "-" x 11 , "-" x 45 ) if ( ! exists( $opts{ 't' } ) );
+      }
+    }
+
+  foreach my $fixid ( @fixList )
+    {
+    next if ( $securityFix{ $fixid }{ 'fixtype' } eq "efix" && ! $efixChecking );
+    next if ( exists( $opts{ 'e' } ) && $securityFix{ $fixid }{ 'fixtype' } ne "efix" );
+
+    my( $overdue, $uplevel, $dueChar, $advisory );
+    $uplevel = 0; $overdue = 0; $dueChar = "";
+
+    $advisory = $fixid;
+
+    if ( $securityFix{ $fixid }{ 'fixtype' } eq "apar"  && exists( $securityFix{ $fixid }{ 'advisory' } ) )
+      {
+      $advisory = $securityFix{ $fixid }{ 'advisory' };
+      }
+
+    $advisory =~ s/[a-z]$//;
+
+    if ( $MY_VERSION ne $REPORT_VERSION )
+      {
+      $securityFix{ $fixid }{ 'installationStatus' } = "NA";
+      }
+    else
+      {
+      $overdue = 1 if ( $securityFix{ $fixid }{ 'implementationDate' } <= $^T );
+
+      if ( $securityFix{ $fixid }{ 'fixtype' } eq "apar" )
+        {
+        foreach my $ptf ( keys( %{ $securityFix{ $fixid }{ 'ptfs' } } ) )
+          {
+          $level = $securityFix{ $fixid }{ 'ptfs' }{ $ptf }{ 'level' };
+
+          if ( exists( $installedSoftware{ $ptf }{ 'level' } ) )
+            {
+            $uplevel++ if ( (split( /\./, $level ))[2] > (split( /\./, $installedSoftware{ $ptf }{ 'level' } ))[2] );
+            }
+          }
+        }
+      elsif ( ! exists( $opts{ 'e' } ) && $securityFix{ $fixid }{ 'fixtype' } eq "efix" )
+        {
+        if ( exists( $securityFix{ $fixid }{ 'supercedingFix' } ) && $securityFix{ $fixid }{ 'supercedingFix' } )
+          {
+          foreach my $supercedingFix ( split( /,/, $securityFix{ $fixid }{ 'supercedingFix' } ) )
+            {
+            $securityFix{ $fixid }{ 'installationStatus' } = "NA"
+              if ( $securityFix{ $fixid }{ 'installationStatus' } ne "Y" &&
+                   exists( $securityFix{ $supercedingFix } ) &&
+                   $securityFix{ $supercedingFix }{ 'publishDate' } <= $^T &&
+                   $securityFix{ $supercedingFix }{ 'publishDate' } != 0 );
+            }
+          }
+        }
+      }
+
+    $dueChar = "+"  if ( $uplevel && $overdue );
+    $dueChar = "-"  if ( $uplevel && ! $overdue );
+    $dueChar = "*"  if ( ! $uplevel && $overdue );
+    $dueChar = " "  if ( ! $uplevel && ! $overdue );
+    $dueChar = "A"  if ( $securityFix{ $fixid }{ 'publishDate' } == 0 );
+    $dueChar = "F"  if ( $securityFix{ $fixid }{ 'publishDate' } > $^T );
+    $dueChar = "I"  if ( $securityFix{ $fixid }{ 'installationStatus' } eq "Y" );
+    $dueChar = "E"  if ( $securityFix{ $fixid }{ 'installationStatus' } eq "E" );
+    $dueChar = "NA" if ( $securityFix{ $fixid }{ 'installationStatus' } eq "NA" );
+    $dueChar = "W"  if ( $securityFix{ $fixid }{ 'installationStatus' } eq "W" );
+
+    if ( exists( $opts{ 'a' } ) || exists( $opts{ 'I' } ) || $dueChar !~ /^(I|E|NA|W)$/ )
+      {
+      $securityFix{ $fixid }{ 'description' } =~ s/\Q$opts{ 't' }\E/\\$opts{ 't' }/g
+        if ( exists( $opts{ 't' } ) );
+
+      if ( exists( $opts{ 'r' } ) )
+        {
+        print( "$fixid\n" );
+        }
+      elsif ( exists( $opts{ 'I' } ) )
+        {
+        if ( $dueChar =~ /^(I|E)$/ ) 
+          { 
+          printf( $printFormat,
+                  $advisory,
+                  $fixid, 
+                  ( exists( $securityFix{ $fixid }{ 'installTime' } ) ) ?
+                    &epoch2readable( $securityFix{ $fixid }{ 'installTime' } ) :
+                      "??/??/????",
+                  ( $dueChar eq "E" ) ?
+                    "[eFix Installed] " . $securityFix{ $fixid }{ 'description' } :
+                      $securityFix{ $fixid }{ 'description' }
+                ); 
+          } 
+        elsif ( $dueChar =~ /^(NA|W)$/ ) 
+          { 
+          printf( $printFormat,
+                  $advisory,
+                  $fixid, 
+                  "99/99/9999",
+                  $securityFix{ $fixid }{ 'description' }
+                ); 
+          } 
+        }
+      else
+        {
+        printf( ( exists( $opts{ 't' } ) ) ? "%s" . $opts{ 't' } : "%-23s  ", "$fixDBShort" )
+          if ( exists( $opts{ 'f' } ) );
+
+        printf( $printFormat,
+                &epoch2readable( $securityFix{ $fixid }{ 'implementationDate' } ),
+                $dueChar,
+                $securityFix{ $fixid }{ 'severity' },
+                ( exists( $opts{ 'n' } ) ) ? $advisory : $fixid,
+                ( exists( $opts{ 'n' } ) && $securityFix{ $fixid }{ 'fixtype' } eq "apar" ) ?
+                  $fixid . ": " . $securityFix{ $fixid }{ 'description' } :
+                    $securityFix{ $fixid }{ 'description' } );
+        }
+
+      if ( exists( $opts{ 'p' } ) && $REPORT_VERSION eq $MY_VERSION )
+        {
+        if ( $securityFix{ $fixid }{ 'fixtype' } eq "apar" && ! exists( $opts{ 'e' } ) )
+          {
+          foreach my $ptf ( sort( keys( %{ $securityFix{ $fixid }{ 'ptfs' } } ) ) )
+            {
+            if ( ! exists( $installedSoftware{ $ptf }{ 'level' } ) )
+              {
+              printf( "  %-30s %-12s %-2s %-12s\n", $ptf, "N/A", "",
+                      $securityFix{ $fixid }{ 'ptfs' }{ $ptf }{ 'level' } );
+              }
+            elsif ( exists( $securityFix{ $fixid }{ 'ptfs' }{ $ptf }{ 'minLevel' } ) &&
+                    &cmpFilesetLevel( $installedSoftware{ $ptf }{ 'level' },
+                                      $securityFix{ $fixid }{ 'ptfs' }{ $ptf }{ 'minLevel' } ) < 0 )
+              {
+              printf( "  %-30s %-12s %-2s %-12s (Minimum)\n", $ptf, $installedSoftware{ $ptf }{ 'level' }, "<",
+                      $securityFix{ $fixid }{ 'ptfs' }{ $ptf }{ 'minLevel' } );
+              }
+            elsif ( &cmpFilesetLevel( $installedSoftware{ $ptf }{ 'level' },
+                                      $securityFix{ $fixid }{ 'ptfs' }{ $ptf }{ 'level' } ) < 0 )
+              {
+              printf( "  %-30s %-12s %-2s %-12s\n", $ptf, $installedSoftware{ $ptf }{ 'level' }, "<",
+                      $securityFix{ $fixid }{ 'ptfs' }{ $ptf }{ 'level' } );
+              }
+            elsif ( exists( $opts{ 'a' } ) )
+              {
+              printf( "  %-30s %-12s %-2s %-12s\n", $ptf, $installedSoftware{ $ptf }{ 'level' }, ">=",
+                      $securityFix{ $fixid }{ 'ptfs' }{ $ptf }{ 'level' } );
+              }
+            }
+          }
+        elsif ( $securityFix{ $fixid }{ 'fixtype' } eq "efix" )
+          {
+          next if ( $securityFix{ $fixid }{ 'installationStatus' } =~ /^(NA|W)$/ );
+
+          if ( exists( $securityFix{ $fixid }{ 'emgr' }{ 'state' } ) )
+            {
+            printf( "  %-43s =  %s\n", "EMGR STATE", 
+                    $securityFix{ $fixid }{ 'emgr' }{ 'state' } );
+            }
+          else
+            {
+            foreach my $file ( sort( keys( %{ $securityFix{ $fixid }{ 'files' } } ) ) )
+              {
+              if ( ! $securityFix{ $fixid }{ 'files' }{ $file }{ 'md5_matched' } )
+                {
+                foreach my $md5 ( split( /\|/, $securityFix{ $fixid }{ 'files' }{ $file }{ 'md5_efix' } ) )
+                  {
+                  printf( "  %-30s %s != %s\n", $file,
+                          $securityFix{ $fixid }{ 'files' }{ $file }{ 'md5_checksum' },
+                          $md5 );
+                  }
+                }
+              elsif ( exists( $opts{ 'a' } ) )
+                {
+                printf( "  %-30s %s == %s\n", $file,
+                        $securityFix{ $fixid }{ 'files' }{ $file }{ 'md5_checksum' },
+                        $securityFix{ $fixid }{ 'files' }{ $file }{ 'md5_checksum' } );
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+## getInstalledSoftware_solaris: get info on installed software using shorev
+#
+sub getInstalledSoftware_solaris
+  {
+  my( $patch, $obsoletes, $installTime, $patch_num, $patch_level, $obsolete_patch, $o_patch_num, $o_patch_level );
+
+  %installedSoftware = ();
+
+  if ( ! open( SHOWREV, "$COMMANDS{ 'showrev' } -a 2>/dev/null |" ) )
+    {
+    die( "$COMMANDS{ 'showrev' } failed" );
+    }
+  while( <SHOWREV> )
+    {
+    chomp();
+
+    if( /^Patch:/ ) 
+      {
+      ($patch, $obsoletes) = ( split( /\s*\S+:\s/ ) )[1,2];
+
+      $installTime = (stat( "/var/sadm/patch/$patch" ))[9];
+
+      if( $patch =~ /^(\d\d\d\d\d\d)-(\d\d)/ )
+        {
+        $patch_num = $1;
+        $patch_level = $2;
+        }
+
+      if( ! exists( $installedSoftware{ $patch_num } ) ||
+          $installedSoftware{ $patch_num }{ 'level' } < $patch_level )
+        {
+        $installedSoftware{ $patch_num }{ 'level' } = $patch_level;
+        $installedSoftware{ $patch_num }{ 'installTime' } = $installTime if ( defined( $installTime ) );
+        }
+
+      foreach $obsolete_patch (split(/, /,$obsoletes))
+        {
+        ($o_patch_num, $o_patch_level) = split(/\-/,$obsolete_patch);
+
+        if( ! exists( $installedSoftware{ $o_patch_num } ) ||
+            $installedSoftware{ $o_patch_num }{ 'level' } < $o_patch_level )
+          {
+          $installedSoftware{ $o_patch_num }{ 'level' } = $o_patch_level;
+          $installedSoftware{ $o_patch_num }{ 'level' }{ 'obsoletes' } = 1;
+          $installedSoftware{ $o_patch_num }{ 'installTime' } = $installTime if ( defined( $installTime ) );
+          }
+        }
+      }
+    }
+  close( SHOWREV );
+
+  if ( ! open( PKGINFO, "$COMMANDS{ 'pkginfo' } 2>/dev/null |" ) )
+    {
+    die( "$COMMANDS{ 'pkginfo' } failed" );
+    }
+  while(<PKGINFO>)
+    {
+    chomp();
+    if( /^\S+\s+(\S+)\s+.*$/ )
+      {
+       $installedSoftware{ $1 } = 1;
+      }
+    }
+  close(PKGINFO);
+  }
+
+## readFixDB_solaris: open fix database and read in data
+#
+sub readFixDB_solaris
+  {
+  %securityFix = ();
+
+  open( FIXDB, "$fixDB" ) || die( "Could not open $fixDB: $!\n" );
+
+  while ( <FIXDB> )
+    {
+    chomp();
+
+    my( @fields );
+    @fields = split( ":::" );
+
+    my( $rowType ) = shift( @fields );
+    next if ( ! defined( $rowType ) );
+
+    if ( $rowType eq "advisory" )
+      {
+      $securityFix{ $fields[0] }{ 'publishDate' } = $fields[1];
+      $securityFix{ $fields[0] }{ 'severity' } = $fields[2];
+      $securityFix{ $fields[0] }{ 'description' } = $fields[3];
+      $securityFix{ $fields[0] }{ 'extendedCheck' } = $fields[4] if ( $fields[4] );
+
+      $securityFix{ $fields[0] }{ 'implementationDate' } =
+        $securityFix{ $fields[0] }{ 'publishDate' } +
+          $SYSTEM_TYPE{ $securityClass }{ 'schedule' }{ $fields[2] };
+
+      $securityFix{ $fields[0] }{ 'installationStatus' } = "NA"
+        if ( ! $SYSTEM_TYPE{ $securityClass }{ 'schedule' }{ $fields[2] } );
+      }
+    elsif ( $rowType eq "patch" )
+      {
+      $securityFix{ $fields[0] }{ 'patch' }{ $fields[1] }{ 'level' } = $fields[2];
+      $securityFix{ $fields[0] }{ 'patch' }{ $fields[1] }{ 'packages' } = $fields[3];
+      }
+    }
+
+  close( FIXDB );
+  }
+
+## checkInstallationStatus_solaris: check installation status of security fixes
+#
+sub checkInstallationStatus_solaris
+  {
+  SECURITYFIX:
+  foreach my $fixid ( keys( %securityFix ) )
+    {
+    next SECURITYFIX if ( exists( $securityFix{ $fixid }{ 'installationStatus' } ) &&
+                          $securityFix{ $fixid }{ 'installationStatus' } eq "NA" );
+
+    foreach my $patch ( keys( %{ $securityFix{ $fixid }{ 'patch' } } ) )
+      {
+      $pkg_exists = 0;
+      $pkg_list = 0;
+
+      if ( defined( $securityFix{ $fixid }{ 'patch' }{ $patch }{ 'packages' } ) )
+        {
+        foreach $secFixPkg ( split( /\,/,$securityFix{ $fixid }{ 'patch' }{ $patch }{ 'packages' } ) )
+          {
+          $pkg_list = 1;
+          $pkg_exists = 1 if exists $installedSoftware{ $secFixPkg };
+          }
+        }
+
+      $installedSoftware{ $patch }{ 'level' } = "00" if ! exists $installedSoftware{ $patch }{ 'level' }; 
+
+      if ( !$pkg_exists && $pkg_list )
+        {
+        $securityFix{ $fixid }{ 'installationStatus' } = "NA";
+        }
+      else
+        {
+        if ( $installedSoftware{ $patch }{ 'level' } <
+             $securityFix{ $fixid }{ 'patch' }{ $patch }{ 'level' } )
+          {
+          $securityFix{ $fixid }{ 'installationStatus' } = "N";
+
+          if ( ( ! exists ( $opts{ 'x' } ) ) && exists( $securityFix{ $fixid }{ 'extendedCheck' } ) && 
+               &runExtendedCheck( $securityFix{ $fixid }{ 'extendedCheck' } ) != 0 )
+            {
+            $securityFix{ $fixid }{ 'installationStatus' } = "W";
+            }
+
+          next SECURITYFIX;
+          }
+        else
+          {
+          $securityFix{ $fixid }{ 'installationStatus' } = "Y";
+
+          if ( exists( $installedSoftware{ $patch }{ 'installTime' } ) &&
+               ( ! exists( $securityFix{ $fixid }{ 'installTime' } ) ||
+                 $securityFix{ $fixid }{ 'installTime' } < $installedSoftware{ $patch }{ 'installTime' } ) )
+            {
+            $securityFix{ $fixid }{ 'installTime' } = $installedSoftware{ $patch }{ 'installTime' };
+            }
+          }
+        }
+      }
+    }
+  }
+
+## report_solaris: report on advisories that need to be installed
+#
+sub report_solaris
+  {
+  my( $printFormat );
+
+  if ( exists( $opts{ 'I' } ) )
+    {
+    $printFormat = ( exists( $opts{ 't' } ) ) ?
+       join( $opts{ 't' }, "%s", "%s", "%s\n" ) :
+         "%-14s %-14s %-s\n";
+    }
+  else
+    {
+    $printFormat = ( exists( $opts{ 't' } ) ) ?
+      join( $opts{ 't' }, "%s", "%s", "%s", "%s", "%s\n" ) :
+        "%-10s  %-3s  %-3s  %-11s  %-s\n";
+    }
+
+  @fixList = &sortFixes( \%securityFix );
+
+  if ( exists( $opts{ 'F' } ) )
+    {
+    my( @fixDBStats );
+    @fixDBStats = stat( $fixDB );
+    print( STDERR "# fixDB = $fixDB, $fixDBStats[7], " . localtime( $fixDBStats[9] ) . "\n" );
+    }
+
+  if ( exists( $opts{ 'C' } ) )
+    {
+    print( STDERR "# securityClass = $securityClass\n" );
+    }
+
+  if ( ! exists( $opts{ 'H' } ) )
+    {
+    if ( exists( $opts{ 'I' } ) )
+      {
+      printf( $printFormat, "ADVISORY", "INSTALL_DATE", "DESCRIPTION" );
+      printf( $printFormat, "-" x 14, "-" x 14, "-" x 50 ) if ( ! exists( $opts{ 't' } ) );
+      }
+    else
+      {
+      printf( ( exists( $opts{ 't' } ) ) ? "%s" . $opts{ 't' } : "%-23s  ", "FIX DB" )
+        if ( exists( $opts{ 'f' } ) );
+      printf( $printFormat, "DUE DATE", "DUE", "SEV", "ADVISORY", "DESCRIPTION" );
+
+      printf( "%-23s  ", "-" x 23 )
+        if ( exists( $opts{ 'f' } ) && ! exists( $opts{ 't' } ) );
+      printf( $printFormat, "-" x 10, "-" x 3, "-" x 3, "-" x 11 , "-" x 45 ) if ( ! exists( $opts{ 't' } ) );
+      }
+    }
+
+  foreach my $advisory ( @fixList )
+    {
+    my( $dueChar ) = " ";
+
+    $dueChar = "*" if ( $securityFix{ $advisory }{ 'implementationDate' } <= $^T );
+    $dueChar = "F" if ( $securityFix{ $advisory }{ 'publishDate' } > $^T );
+    $dueChar = "I" if ( $securityFix{ $advisory }{ 'installationStatus' } eq "Y" );
+    $dueChar = "NA" if ( $securityFix{ $advisory }{ 'installationStatus' } eq "NA" );
+    $dueChar = "W" if ( $securityFix{ $advisory }{ 'installationStatus' } eq "W" );
+
+    next if ( ! exists( $opts{ 'a' } ) && ! exists( $opts{ 'I' } ) && $dueChar =~ /^(I|NA|W)$/ );
+
+    $securityFix{ $advisory }{ 'description' } =~ s/\Q$opts{ 't' }\E/\\$opts{ 't' }/g
+      if ( exists( $opts{ 't' } ) );
+
+    if ( exists( $opts{ 'r' } ) )
+      {
+      print( "$advisory\n" );
+      }
+    elsif ( exists( $opts{ 'I' } ) )
+      {
+      if ( $dueChar eq "I" )
+        { 
+        printf( $printFormat,
+                $advisory, 
+                ( exists( $securityFix{ $advisory }{ 'installTime' } ) ) ?
+                  &epoch2readable( $securityFix{ $advisory }{ 'installTime' } ) :
+                    "??/??/????",
+                $securityFix{ $advisory }{ 'description' }
+              ); 
+        } 
+      elsif ( $dueChar =~ /^(NA|W)$/ ) 
+        { 
+        printf( $printFormat,
+                $advisory, 
+                "99/99/9999",
+                $securityFix{ $advisory }{ 'description' }
+              ); 
+        } 
+      }
+    else
+      {
+      printf( ( exists( $opts{ 't' } ) ) ? "%s" . $opts{ 't' } : "%-23s  ", "$fixDBShort" )
+        if ( exists( $opts{ 'f' } ) );
+
+      printf( $printFormat,
+              &epoch2readable( $securityFix{ $advisory }{ 'implementationDate' } ),
+              $dueChar,
+              $securityFix{ $advisory }{ 'severity' },
+              $advisory,
+              $securityFix{ $advisory }{ 'description' } );
+
+      if ( exists( $opts{ 'p' } ) )
+        {
+        foreach my $patch ( sort( keys( %{ $securityFix{ $advisory }{ 'patch' } } ) ) )
+          {
+          $installedSoftware{ $patch }{ 'level' } = "00" if ! exists $installedSoftware{ $patch }{ 'level' };
+
+          if ( $installedSoftware{ $patch }{ 'level' } < 
+                 $securityFix{ $advisory }{ 'patch' }{ $patch }{ 'level' } )
+            {
+            $securityFix{ $advisory }{ 'patch' }{ $patch }{ 'status' } = "<";
+            }
+          else
+            {
+            $securityFix{ $advisory }{ 'patch' }{ $patch }{ 'status' } = ">=";
+            }
+          printf( "  %-30s %-11s %-11s %-20s\n", $patch,
+                  ( exists( $installedSoftware{ $patch } ) ) ?
+                    $installedSoftware{ $patch }{ 'level' } :
+                      "N/A",
+                  ( exists( $securityFix{ $advisory }{ 'patch' }{ $patch }{ 'status' } ) ) ?
+                    $securityFix{ $advisory }{ 'patch' }{ $patch }{ 'status' } :
+                      "",
+                  $securityFix{ $advisory }{ 'patch' }{ $patch }{ 'level' } );
+          }
+        }
+      }
+    }
+  }
+
+## getInstalledSoftware_hpux: get info on installed software using swlist
+#
+sub getInstalledSoftware_hpux
+  {
+  my( $name, $is_patch, $revision, $prevRevision, $install_date, @supersedes, @parts );
+
+  %installedSoftware = ();
+
+  if ( ! open( SWLIST, "$COMMANDS{ 'swlist' } -a is_patch -a revision -a install_date -l product 2>/dev/null |" ) )
+    {
+    die( "$COMMANDS{ 'swlist' } failed" );
+    }
+
+  while( <SWLIST> )
+    {
+    next if ( /^\s*$|^\s*#/ );
+
+    chomp();
+    $_ =~ s/^\s*|\s*$//g;
+
+    ( $name, $is_patch, $revision, $install_date ) = split( /\s+/ );
+
+    if ( defined( $install_date ) && $install_date =~ /(\d\d\d\d)(\d\d)(\d\d)(\d\d)(\d\d).(\d\d)/ )
+      {
+      $install_date = timelocal( $6, $5, $4, $3, ($2 - 1), $1 );
+      }
+    else
+      {
+      $install_date = 0;
+      }
+
+    if ( $is_patch eq "true" )
+      {
+      $installedSoftware{ 'patch' }{ $name }{ 'revision' } = $revision;
+      $installedSoftware{ 'patch' }{ $name }{ 'install_date' } = $install_date;
+      }
+    else
+      {
+      $installedSoftware{ 'product' }{ $name }{ 'revision' } = $revision;
+      $installedSoftware{ 'product' }{ $name }{ 'install_date' } = $install_date;
+      }
+    }
+
+  close( SWLIST );
+
+  if ( ! open( SWLIST, "$COMMANDS{ 'swlist' } -a supersedes -l patch 2>/dev/null |" ) )
+    {
+    die( "$COMMANDS{ 'swlist' } failed" );
+    }
+
+  while( <SWLIST> )
+    {
+    next if ( /^\s*$|^\s*#/ );
+
+    chomp();
+    $_ =~ s/^\s*|\s*$//g;
+
+    ( $name, @supersedes ) = split( /[\s,]+/ );
+
+    next if ( scalar( @supersedes ) < 1 );
+
+    $name =~ s/\..*//;
+
+    foreach my $superseded ( @supersedes )
+      {
+      next if ( $superseded !~ /^...._\d{5}/ );
+      $superseded =~ s/\..*//;
+      $installedSoftware{ 'patch' }{ $superseded }{ 'supersededBy' } = $name;
+      $installedSoftware{ 'patch' }{ $superseded }{ 'install_date' } = $installedSoftware{ 'patch' }{ $name }{ 'install_date' };
+      }
+    }
+
+  close( SWLIST );
+
+  if ( ! open( SWLIST, "$COMMANDS{ 'swlist' } -a revision -a install_date -l fileset 2>/dev/null |" ) )
+    {
+    die( "$COMMANDS{ 'swlist' } failed" );
+    }
+
+  while( <SWLIST> )
+    {
+    next if ( /^\s*$/ );
+
+    chomp();
+    $_ =~ s/^[\s#]*|\s*$//g;
+
+    @parts = split( /\s+/ );
+
+    if ( scalar( @parts ) == 3 && $parts[2] =~ /(\d\d\d\d)(\d\d)(\d\d)(\d\d)(\d\d).(\d\d)/ )
+      {
+      $name = $parts[0];
+      $revision = $parts[1];
+      $install_date = timelocal( $6, $5, $4, $3, ($2 - 1), $1 );
+      }
+    elsif ( scalar( @parts ) == 2 && $parts[1] =~ /(\d\d\d\d)(\d\d)(\d\d)(\d\d)(\d\d).(\d\d)/ )
+      {
+      $name = $parts[0];
+      $revision = $prevRevision;
+      $install_date = timelocal( $6, $5, $4, $3, ($2 - 1), $1 );
+      }
+    else
+      {
+      next;
+      }
+
+    $installedSoftware{ 'fileset' }{ $name }{ 'revision' } = $revision;
+    $installedSoftware{ 'fileset' }{ $name }{ 'install_date' } = $install_date;
+
+    $prevRevision = $revision;
+    }
+
+  close( SWLIST );
+  }
+
+## readFixDB_hpux: open fix database and read in data
+#
+sub readFixDB_hpux
+  {
+  %securityFix = ();
+
+  open( FIXDB, "$fixDB" ) || die( "Could not open $fixDB: $!\n" );
+
+  while ( <FIXDB> )
+    {
+    chomp();
+
+    my( @fields );
+    @fields = split( ":::" );
+
+    my( $rowType ) = shift( @fields );
+    next if ( ! defined( $rowType ) );
+
+    if ( $rowType eq "advisory" )
+      {
+      $securityFix{ $fields[0] }{ 'publishDate' } = $fields[1];
+      $securityFix{ $fields[0] }{ 'severity' } = $fields[2];
+      $securityFix{ $fields[0] }{ 'description' } = $fields[3];
+      $securityFix{ $fields[0] }{ 'extendedCheck' } = $fields[4] if ( $fields[4] );
+
+      $securityFix{ $fields[0] }{ 'implementationDate' } = 
+        $securityFix{ $fields[0] }{ 'publishDate' } +
+          $SYSTEM_TYPE{ $securityClass }{ 'schedule' }{ $fields[2] };
+
+      $securityFix{ $fields[0] }{ 'installationStatus' } = "NA"
+        if ( ! $SYSTEM_TYPE{ $securityClass }{ 'schedule' }{ $fields[2] } );
+
+      $securityFix{ $fields[0] }{ 'patch' } = ();
+      $securityFix{ $fields[0] }{ 'fileset' } = ();
+      $securityFix{ $fields[0] }{ 'product' } = ();
+      }
+    elsif ( $rowType eq "patch" )
+      {
+      foreach my $fileset ( split( /,/, $fields[2] ) )
+        {
+        push( @{ $securityFix{ $fields[0] }{ 'patch' }{ $fields[1] }{ 'fileset' } }, $fileset );
+        }
+      }
+    elsif ( $rowType eq "product" )
+      {
+      $securityFix{ $fields[0] }{ 'product' }{ $fields[1] }{ 'revision' } = $fields[2];
+      }
+    elsif ( $rowType eq "fileset" )
+      {
+      $securityFix{ $fields[0] }{ 'fileset' }{ $fields[1] }{ 'revision' } = $fields[2];
+      }
+    }
+
+  close( FIXDB );
+  }
+
+## checkInstallationStatus_hpux: check installation status of security fixes
+#
+sub checkInstallationStatus_hpux
+  {
+  ADVISORY:
+  foreach my $advisory ( keys( %securityFix ) )
+    {
+    next if ( exists( $securityFix{ $advisory }{ 'installationStatus' } ) &&
+              $securityFix{ $advisory }{ 'installationStatus' } eq "NA" );
+
+    foreach my $patch ( keys( %{ $securityFix{ $advisory }{ 'patch' } } ) )
+      {
+      if ( exists( $installedSoftware{ 'patch' }{ $patch } ) )
+        {
+        if ( exists( $installedSoftware{ 'patch' }{ $patch }{ 'supersededBy' } ) )
+          {
+          $securityFix{ $advisory }{ 'patch' }{ $patch }{ 'status' } = "SUPERSEDED BY " .
+            $installedSoftware{ 'patch' }{ $patch }{ 'supersededBy' };
+          }
+        else
+          {
+          $securityFix{ $advisory }{ 'patch' }{ $patch }{ 'status' } = "INSTALLED";
+          }
+
+        $securityFix{ $advisory }{ 'installationStatus' } = "Y";
+        $securityFix{ $advisory }{ 'installTime' } = $installedSoftware{ 'patch' }{ $patch }{ 'install_date' };
+        }
+      else
+        {
+        FILESET:
+        foreach my $fileset ( @{ $securityFix{ $advisory }{ 'patch' }{ $patch }{ 'fileset' } } )
+          {
+          if ( exists( $installedSoftware{ 'fileset' }{ $fileset } ) )
+            {
+            $securityFix{ $advisory }{ 'patch' }{ $patch }{ 'status' } = "NOT INSTALLED";
+            $securityFix{ $advisory }{ 'installationStatus' } = "N";
+
+            if ( ( ! exists( $opts{ 'x' } ) ) && exists( $securityFix{ $advisory }{ 'extendedCheck' } ) &&
+               &runExtendedCheck( $securityFix{ $advisory }{ 'extendedCheck' } ) != 0 )
+              {
+              $securityFix{ $advisory }{ 'installationStatus' } = "W";
+              }
+
+            next ADVISORY;
+            }
+          else
+            {
+            $securityFix{ $advisory }{ 'patch' }{ $patch }{ 'status' } = "NOT REQUIRED";
+            next FILESET;
+            }
+          }
+        }
+      }
+
+    foreach my $type ( "fileset", "product" )
+      {
+      foreach my $name ( keys( %{ $securityFix{ $advisory }{ $type } } ) )
+        {
+        if ( exists( $installedSoftware{ $type }{ $name } ) )
+          {
+          if ( &cmpFilesetLevel( $installedSoftware{ $type }{ $name }{ 'revision' },
+                                 $securityFix{ $advisory }{ $type }{ $name }{ 'revision' } ) >= 0 )
+            {
+            $securityFix{ $advisory }{ $type }{ $name }{ 'status' } = ">=";
+            $securityFix{ $advisory }{ 'installationStatus' } = "Y";
+            }
+          else
+            {
+            $securityFix{ $advisory }{ $type }{ $name }{ 'status' } = "<";
+            $securityFix{ $advisory }{ 'installationStatus' } = "N";
+
+            if ( ( ! exists( $opts{ 'x' } ) ) && exists( $securityFix{ $advisory }{ 'extendedCheck' } ) &&
+               &runExtendedCheck( $securityFix{ $advisory }{ 'extendedCheck' } ) != 0 )
+              {
+              $securityFix{ $advisory }{ 'installationStatus' } = "W";
+              }
+
+            next ADVISORY;
+            }
+          }
+        }
+      }
+
+    $securityFix{ $advisory }{ 'installationStatus' } = "NA"
+      if ( ! $securityFix{ $advisory }{ 'installationStatus' } );
+    }
+  }
+
+## report_hpux: report on advisories that need to be installed
+#
+sub report_hpux
+  {
+  my( $printFormat );
+
+  if ( exists( $opts{ 'I' } ) )
+    {
+    $printFormat = ( exists( $opts{ 't' } ) ) ?
+       join( $opts{ 't' }, "%s", "%s", "%s\n" ) :
+         "%-20s %-20s %-20s\n";
+    }
+  else
+    {
+    $printFormat = ( exists( $opts{ 't' } ) ) ?
+       join( $opts{ 't' }, "%s", "%s", "%s", "%s", "%s\n" ) :
+         "%-10s  %-3s  %-3s  %-11s  %-s\n";
+    }
+
+  @fixList = &sortFixes( \%securityFix );
+
+  if ( exists( $opts{ 'F' } ) )
+    {
+    my( @fixDBStats );
+    @fixDBStats = stat( $fixDB );
+    print( STDERR "# fixDB = $fixDB, $fixDBStats[7], " . localtime( $fixDBStats[9] ) . "\n" );
+    }
+
+  if ( exists( $opts{ 'C' } ) )
+    {
+    print( STDERR "# securityClass = $securityClass\n" );
+    }
+
+  if ( ! exists( $opts{ 'H' } ) )
+    {
+    if ( exists( $opts{ 'I' } ) )
+      {
+      printf( $printFormat, "ADVISORY", "VENDOR_ADVISORY", "INSTALL_DATE" );
+      printf( $printFormat, "-" x 20, "-" x 20, "-" x 20 ) if ( ! exists( $opts{ 't' } ) );
+      }
+    else
+      {
+      printf( ( exists( $opts{ 't' } ) ) ? "%s" . $opts{ 't' } : "%-23s  ", "FIX DB" )
+        if ( exists( $opts{ 'f' } ) );
+      printf( $printFormat, "DUE DATE", "DUE", "SEV", "ADVISORY", "DESCRIPTION" );
+
+      printf( "%-23s  ", "-" x 23 )
+        if ( exists( $opts{ 'f' } ) && ! exists( $opts{ 't' } ) );
+      printf( $printFormat, "-" x 10, "-" x 3, "-" x 3, "-" x 11 , "-" x 45 ) if ( ! exists( $opts{ 't' } ) );
+      }
+    }
+
+  foreach my $advisory ( @fixList )
+    {
+    my( $dueChar ) = " ";
+    my( $vendor_advisory );
+
+    $dueChar = "*" if ( $securityFix{ $advisory }{ 'implementationDate' } <= $^T );
+    $dueChar = "F" if ( $securityFix{ $advisory }{ 'publishDate' } > $^T );
+    $dueChar = "I" if ( $securityFix{ $advisory }{ 'installationStatus' } eq "Y" );
+    $dueChar = "NA" if ( $securityFix{ $advisory }{ 'installationStatus' } eq "NA" );
+    $dueChar = "W" if ( $securityFix{ $advisory }{ 'installationStatus' } eq "W" );
+
+    next if ( ! exists( $opts{ 'a' } ) && ! exists( $opts{ 'I' } ) && $dueChar =~ /^(I|NA|W)$/ );
+
+    $securityFix{ $advisory }{ 'description' } =~ s/\Q$opts{ 't' }\E/\\$opts{ 't' }/g
+      if ( exists( $opts{ 't' } ) );
+
+    if ( exists( $opts{ 'r' } ) )
+      {
+      print( "$advisory\n" );
+      }
+    if ( exists( $opts{ 'I' } ) )
+      {
+      if ( $securityFix{ $advisory }{ 'description' } =~ /\[HP/ )
+        {
+        ( $vendor_advisory = $securityFix{ $advisory }{ 'description' } ) =~ s/.*\[(HP.*)\].*/$1/;
+        } 
+
+      if ( $dueChar eq "I" ) 
+        { 
+        printf( $printFormat,
+                $advisory, 
+                $vendor_advisory, 
+                &epoch2readable( $securityFix{ $advisory }{ 'installTime' } ) 
+              ); 
+        } 
+      elsif ( $dueChar =~ /^(NA|W)$/ ) 
+        { 
+        printf( $printFormat,
+                $advisory, 
+                $vendor_advisory, 
+                "99/99/9999" 
+              ); 
+        } 
+      }
+    else
+      {
+      printf( ( exists( $opts{ 't' } ) ) ? "%s" . $opts{ 't' } : "%-23s  ", "$fixDBShort" )
+        if ( exists( $opts{ 'f' } ) );
+
+      printf( $printFormat,
+              &epoch2readable( $securityFix{ $advisory }{ 'implementationDate' } ),
+              $dueChar,
+              $securityFix{ $advisory }{ 'severity' },
+              $advisory,
+              $securityFix{ $advisory }{ 'description' } );
+
+      if ( exists( $opts{ 'p' } ) )
+        {
+        foreach my $patch ( sort( keys( %{ $securityFix{ $advisory }{ 'patch' } } ) ) )
+          { 
+          if ( ! exists( $securityFix{ $advisory }{ 'patch' }{ $patch }{ 'status' } ) )
+            {
+            if ( exists( $installedSoftware{ 'patch' }{ $patch } ) )
+              {
+              if ( exists( $installedSoftware{ 'patch' }{ $patch }{ 'supersededBy' } ) )
+                {
+                $securityFix{ $advisory }{ 'patch' }{ $patch }{ 'status' } = "SUPERSEDED BY " .
+                  $installedSoftware{ 'patch' }{ $patch }{ 'supersededBy' };
+                }
+              else
+                {
+                $securityFix{ $advisory }{ 'patch' }{ $patch }{ 'status' } = "INSTALLED";
+                }
+              }
+            else
+              {
+              FILESET:
+              foreach my $fileset ( @{ $securityFix{ $advisory }{ 'patch' }{ $patch }{ 'fileset' } } )
+                {
+                if ( exists( $installedSoftware{ 'fileset' }{ $fileset } ) )
+                  {
+                  $securityFix{ $advisory }{ 'patch' }{ $patch }{ 'status' } = "NOT INSTALLED";
+                  last FILESET;
+                  }
+                else
+                  {
+                  $securityFix{ $advisory }{ 'patch' }{ $patch }{ 'status' } = "NOT REQUIRED";
+                  next FILESET;
+                  }
+                }
+              }
+            }
+
+          printf( "  %-10s %-30s %s\n", "PATCH", $patch, $securityFix{ $advisory }{ 'patch' }{ $patch }{ 'status' } );
+          }
+
+
+        foreach my $type ( "fileset", "product" )
+          {
+          foreach my $name ( keys( %{ $securityFix{ $advisory }{ $type } } ) )
+            {
+            if ( exists( $installedSoftware{ $type }{ $name } ) )
+              {
+              if ( &cmpFilesetLevel( $installedSoftware{ $type }{ $name }{ 'revision' },
+                                     $securityFix{ $advisory }{ $type }{ $name }{ 'revision' } ) >= 0 )
+                {
+                $securityFix{ $advisory }{ $type }{ $name }{ 'status' } = ">=";
+                }
+              else
+                {
+                $securityFix{ $advisory }{ $type }{ $name }{ 'status' } = "<";
+                }
+              }
+
+            printf( "  %-10s %-30s %-20s %-2s %-20s\n", uc( $type ), $name,
+                    ( $installedSoftware{ $type }{ $name }{ 'revision' } ) ?
+                    $installedSoftware{ $type }{ $name }{ 'revision' } : "N/A",
+                    ( $securityFix{ $advisory }{ $type }{ $name }{ 'status' } ) ?
+                    $securityFix{ $advisory }{ $type }{ $name }{ 'status' } : "",
+                    $securityFix{ $advisory }{ $type }{ $name }{ 'revision' } );
+            }
+          }
+        }
+      }
+    }
+  }
+
+## processRunning: returns success if a process is running with the name given
+#
+sub processRunning
+  {
+  if ( ! defined( @processes ) )
+    {
+    open( PS_EO, "ps -eo comm |" );
+
+    while ( <PS_EO> )
+      {
+      push( @processes, $_ );
+      }
+
+    close( PS_EO );
+    }
+
+  return ( grep { /^$_[0]$/ } @processes ) ? 0 : 1;
+  }
+
+## portOpen: returns success if the the system is listening on the specified port
+#
+sub portOpen
+  {
+  if ( ! defined( @openPorts ) )
+    {
+    if ( $Config{ 'osname' } eq "linux" )
+      {
+      open( NETSTAT_AN, "netstat -an --inet |" );
+
+      while ( <NETSTAT_AN> )
+        {
+        push( @openPorts, (split( /:/, (split( /\s+/ ))[3] ))[1] );
+        }
+
+      close( NETSTAT_AN );
+      }
+    else
+      {
+      open( NETSTAT_AN, "netstat -an -f inet |" );
+
+      while ( <NETSTAT_AN> )
+        {
+        push( @openPorts, (split( /\./, (split( /\s+/ ))[3] ))[-1] );
+        }
+
+      close( NETSTAT_AN );
+      }
+    }
+
+  return ( grep { /^$_[0]$/ } @openPorts ) ? 0 : 1;
+  }
+
+## getFixDB: determine where the fix database resides, and optionally
+##           retrieve it via FTP from a central server
+#
+sub getFixDB
+  {
+  my( $secfix_name ) = "";
+
+  if ( $Config{ 'osname' } eq "linux" )
+    {
+    $linux_dist = "";
+    $linux_dist_version = "";
+    $linux_dist_rpm = "";
+    $linux_arch = "";
+    $linux_patch_level = "";
+
+    if ( -f "/etc/vmware-release" )
+      {
+      $linux_dist = "VMWare";
+      $linux_dist_version = `$COMMANDS{ 'rpm' } -qf /etc/vmware-release --qf '%{VERSION}'`;
+      $secfix_name = "secfixdb." . $linux_dist . $linux_dist_version;
+      }
+    elsif ( -f "/etc/redhat-release" )
+      {
+      $linux_dist = "RedHat";
+      $linux_dist_version = `$COMMANDS{ 'rpm' } -qf /etc/redhat-release --qf '%{VERSION}' | sort -u`;
+      $linux_dist_rpm = `$COMMANDS{ 'rpm' } -qf /etc/redhat-release --qf '%{NAME}'`;
+
+      chomp( $linux_dist_version ); 
+      chomp( $linux_dist_rpm ); 
+
+      $linux_dist = "CentOS" if ( $linux_dist_rpm eq "centos-release" );
+      $linux_dist = "Fedora" if ( $linux_dist_rpm eq "fedora-release" );
+
+      $linux_dist_version .= "Server" if ( $linux_dist_version =~ /^[0-9]$/ && $linux_dist_rpm =~ /^enterprise-/ );
+
+      $secfix_name = "secfixdb." . $linux_dist . $linux_dist_version;
+      }
+    elsif ( -f "/etc/SuSE-release" )
+      {
+      open ( RELEASE, "/etc/SuSE-release" );
+
+      while ( <RELEASE> )
+        {
+        if ( /^SuSE SLES|Enterprise/i )
+          {
+          $linux_dist = "SLES";
+          ( $linux_arch = $_ ) =~ s/.*\((.*)\).*/$1/;
+          }
+        elsif ( /^SuSE Linux|openSUSE/i )
+          {
+          $linux_dist = "SuSE";
+          ( $linux_arch = $_ ) =~ s/.*\((.*)\).*/$1/;
+          }
+        elsif ( /^VERSION/i )
+          {
+          $linux_dist_version = (split( /\s*=\s*/ ))[1];
+          }
+        elsif ( /^PATCHLEVEL/i )
+          {
+          $linux_patch_level = (split( /\s*=\s*/ ))[1];
+          }
+        }
+
+      close( RELEASE );
+
+      chomp( $linux_dist );
+      chomp( $linux_dist_version );
+      chomp( $linux_arch );
+      chomp( $linux_patch_level );
+
+      $linux_arch = lc( $linux_arch );
+      $linux_arch =~ s~/~~g;
+      $linux_arch =~ s/i.86/x86/;
+
+      if ( $linux_dist_version >= 10 && $linux_patch_level )
+        {
+        $secfix_name = "secfixdb." . $linux_dist . $linux_dist_version . "-SP" . $linux_patch_level . "_" . $linux_arch;
+        }
+      else
+        {
+        $secfix_name = "secfixdb." . $linux_dist . $linux_dist_version . "_" . $linux_arch;
+        }
+      }
+    elsif ( -f "/etc/debian_version" )
+      {
+      $linux_dist = "Debian";
+
+      if ( -f "/etc/lsb-release" )
+        {
+        open ( RELEASE, "/etc/lsb-release" );
+
+        while ( <RELEASE> )
+          {
+          if ( /Ubuntu/i )
+            {
+            $linux_dist = "Ubuntu";
+            }
+          elsif ( /^DISTRIB_RELEASE/i )
+            {
+            $linux_dist_version = (split( /\s*=\s*/ ))[1];
+            }
+          }
+
+        close( RELEASE );
+        }
+
+      if ( $linux_dist eq "Debian" )
+        {
+        open ( RELEASE, "/etc/debian_version" );
+        $linux_dist_version = <RELEASE>;
+        close( RELEASE );
+        }
+
+      chomp( $linux_dist_version );
+      $secfix_name = "secfixdb." . $linux_dist . $linux_dist_version;
+      }
+    elsif ( -f "/etc/UnitedLinux-release" )
+      {
+      $linux_dist = "UL";
+
+      open ( RELEASE, "/etc/UnitedLinux-release" );
+
+      while ( <RELEASE> )
+        {
+        if ( /United/ )
+          {
+          ( $linux_arch = $_ ) =~ s/.*\((.*)\).*/$1/;
+          }
+        elsif ( /^VERSION/i )
+          {
+          $linux_dist_version = (split( /\s*=\s*/ ))[1];
+          }
+        }
+
+      close( RELEASE );
+
+      chomp( $linux_dist );
+      chomp( $linux_dist_version );
+      chomp( $linux_arch );
+
+      $linux_arch = lc( $linux_arch );
+      $linux_arch =~ s~/~~g;
+      $linux_arch =~ s/i.86/x86/;
+
+      $secfix_name = "secfixdb." . $linux_dist . $linux_dist_version . "_" . $linux_arch;
+      }
+    else
+      {
+      die( "Linux distribution not supported.\n" );
+      }
+    }
+  elsif ( $Config{ 'osname' } eq "aix" )
+    {
+    $legacyFixDB = 0;
+    my( $DB_VERSION ) = $REPORT_VERSION;
+    $DB_VERSION =~ s/\.//g;
+
+    $secfix_name = "secfixdb.aix" . $DB_VERSION;
+    $secfix_name_old = "secfixdb.aix";
+    }
+  elsif ( $Config{ 'osname' } eq "solaris" )
+    {
+    $secfix_name = "secfixdb." . $Config{ 'osname' } . $OPSYS_RELEASE;
+    $secfix_name .= "_x86" if ( $OPSYS_ARCH =~ /^i.86$/ );
+    }
+  elsif ( $Config{ 'osname' } eq "hpux" )
+    {
+    $secfix_name = "secfixdb." . $Config{ 'osname' } . $OPSYS_RELEASE;
+    }
+
+  if ( -f "$CONFIG_DIR/$secfix_name" )
+    {
+    $fixDB = "$CONFIG_DIR/$secfix_name";
+    }
+  elsif ( -f "$BASEDIR/$secfix_name" )
+    {
+    $fixDB = "$BASEDIR/$secfix_name";
+    }
+  elsif ( defined( $secfix_name_old ) && -f "$CONFIG_DIR/$secfix_name_old" )
+    {
+    $fixDB = "$CONFIG_DIR/$secfix_name_old";
+    $legacyFixDB = 1;
+    }
+  elsif ( defined( $secfix_name_old ) && -f "$BASEDIR/$secfix_name_old" )
+    {
+    $fixDB = "$BASEDIR/$secfix_name_old";
+    $legacyFixDB = 1;
+    }
+  else
+    {
+    $fixDB = "$CONFIG_DIR/$secfix_name";
+    }
+
+  $fixDBShort = basename( $fixDB );
+
+  if ( $SECFIXDB_SERVER )
+    {
+    require Net::FTP;
+
+    if ( $ftp = Net::FTP->new( "$SECFIXDB_SERVER" ) )
+      {
+      eval
+        {
+        $SIG{ __DIE__ } = sub { warn( $_[0] ) };
+
+        $ftp->login( "$SECFIXDB_USER", "$SECFIXDB_PASSWD" );
+
+        $ftpPath = "$SECFIXDB_PATH/$secfix_name";
+
+        $lastUpdate = $ftp->mdtm( "$ftpPath" );
+        die( "# Security fix DB does not exist on server: $ftpPath\n" ) if ( ! $lastUpdate );
+
+        if ( ! -f "$fixDB" || $lastUpdate > (stat( "$fixDB" ))[9] )
+          {
+          if ( ( -f "$fixDB" && -w "$fixDB" ) || ( ! -f "$fixDB" && -w dirname( "$fixDB" ) ) )
+            {
+            $ftp->get( "$ftpPath", "$fixDB" );
+            utime( $lastUpdate, $lastUpdate, "$fixDB" );
+            }
+          else
+            {
+            warn( "# Could not write to security fix DB: $fixDB\n" );
+            warn( "# You do not have the latest fix information.\n" );
+            }
+          }
+
+        $ftp->quit();
+        };
+      }
+    else
+      {
+      warn( "# Could not connect to security fix server: $SECFIXDB_SERVER\n" );
+      warn( "# You may not have the latest fix information.\n" );
+      }
+    }
+
+  if ( ! -f $fixDB )
+    {
+    die( "Security fix DB does not exist: $fixDB\n" );
+    }
+  }
+
+## checkRoot: issues a warning if not run as root
+#
+sub checkRoot
+  {
+  warn( "# Running as a user other than root may produce erroneous results.\n" )
+    if ( $> != 0 );
+  }
+
+## runExtendedCheck: run extended check and pass return code
+#
+sub runExtendedCheck
+  {
+  my( $extendedCheck ) = $_[0];
+  my( $extChkRC );
+
+  if ( $extendedCheck =~ /^\&.*/ )
+    {
+    if ( $extendedCheck =~ /^\&(portOpen|processRunning)\(/ )
+      {
+      $extChkRC = eval( $extendedCheck );
+      }
+    else
+      {
+      warn( "Unrecognized extended check: $extendedCheck\n" );
+      $extChkRC = 0;
+      }
+    }
+  else
+    {
+    system( "$extendedCheck >/dev/null 2>&1" );
+    $extChkRC = $?;
+    }
+
+  return $extChkRC;
+  }
+
+BEGIN { use Config; use File::Basename; push( @INC, dirname( $0 ) . "/perlmods/" . $Config{ 'archname' }, dirname( $0 ) . "/perlmods" ); }
+
+use Config;
+use POSIX qw( strftime );
+use Getopt::Std;
+use sigtrap qw( stack-trace error-signals );
+use Time::Local;
+
+$BASEDIR = dirname( $0 );
+
+%opts = ();
+getopts( 'c:CEeo:Hv:t:s:d:pxaIi:S:D:U:P:fFnT:', \%opts ) || usage();
+
+$efixChecking = 0;
+
+if ( $] >= 5.005 && ! exists( $opts{ 'E' } ) && $Config{ 'osname' } eq "aix" )
+  {
+  $efixChecking = 1 if ( eval { require Digest::MD5; } );
+  }
+
+die( "E-fix checking has been disabled.\n" )
+  if ( exists( $opts{ 'e' } ) && ! $efixChecking );
+
+$CONFIG_DIR = "$BASEDIR/../etc";
+$CONFIG_DIR = $opts{ 'd' } if ( exists( $opts{ 'd' } ) );
+
+%SYSTEM_TYPE = ();
+%COMMANDS = ();
+
+$OPSYS_VERSION = `$Config{ 'uname' } -v`;
+$OPSYS_RELEASE = `$Config{ 'uname' } -r`;
+chomp( $OPSYS_VERSION );
+chomp( $OPSYS_RELEASE );
+
+if ( $Config{ 'osname' } eq "solaris" )
+  {
+  $OPSYS_ARCH = `$Config{ 'uname' } -p`;
+  chomp( $OPSYS_ARCH );
+  }
+
+if ( $Config{ 'osname' } eq "aix" )
+  {
+  $COMMANDS{ 'lslpp' } = "/usr/bin/lslpp";
+  $COMMANDS{ 'instfix' } = "/usr/sbin/instfix";
+  $COMMANDS{ 'hostname' } = "/usr/bin/hostname";
+  $COMMANDS{ 'oslevel' } = "/usr/bin/oslevel";
+  $COMMANDS{ 'sum' } = "/usr/bin/sum";
+  $COMMANDS{ 'hostname' } = "/usr/bin/hostname";
+  $COMMANDS{ 'emgr' } = "/usr/sbin/emgr";
+  $COMMANDS{ 'instfix' } = "/usr/sbin/instfix";
+  $COMMANDS{ 'odmget' } = "/usr/bin/odmget";
+  $REPORT_VERSION = "$OPSYS_VERSION.$OPSYS_RELEASE";
+  $MY_VERSION = "$OPSYS_VERSION.$OPSYS_RELEASE";
+  }
+elsif ( $Config{ 'osname' } eq "linux" )
+  {
+  if ( -f "/etc/debian_version" )
+    {
+    $COMMANDS{ 'dpkg' } = "/usr/bin/dpkg" 
+    }
+  else
+    {
+    $COMMANDS{ 'rpm' } = "/bin/rpm";
+    }
+
+  $COMMANDS{ 'hostname' } = "/bin/hostname";
+  }
+elsif ( $Config{ 'osname' } eq "solaris" )
+  {
+  $COMMANDS{ 'showrev' } = "/bin/showrev";
+  $COMMANDS{ 'pkginfo' } = "/usr/bin/pkginfo";
+  $COMMANDS{ 'hostname' } = "/bin/hostname";
+  $COMMANDS{ 'pkginfo' } = "/bin/pkginfo";
+  }
+elsif ( $Config{ 'osname' } eq "hpux" )
+  {
+  $COMMANDS{ 'swlist' } = "/usr/sbin/swlist";
+  $COMMANDS{ 'hostname' } = "/usr/bin/hostname";
+  }
+
+$SECONDS_IN_DAY = 24 * 60 * 60 ;
+
+$SECFIXDB_SERVER = "";
+$SECFIXDB_USER = "anonymous";
+$SECFIXDB_PASSWD = getpwuid( $> ) . "\@" . `$COMMANDS{ 'hostname' }`;
+$SECFIXDB_PATH = "";
+
+$DATE_FORMAT = "%m/%d/%Y";
+
+%SYSTEM_TYPE = 
+    (
+    "internet",
+        {
+        "name", "Internet Systems",
+        "schedule",
+            {
+            H, 3  * $SECONDS_IN_DAY,
+            M, 7  * $SECONDS_IN_DAY,
+            L, 30 * $SECONDS_IN_DAY,
+            N, 0
+            },
+        },
+    "vbp",
+        {
+        "name", "Systems Subject to Disaster Recovery",
+        "schedule",
+            {
+            H, 7   * $SECONDS_IN_DAY,
+            M, 60  * $SECONDS_IN_DAY,
+            L, 180 * $SECONDS_IN_DAY,
+            N, 0
+            },
+        },
+    "dr",
+        {
+        "name", "Systems Subject to Disaster Recovery",
+        "schedule",
+            {
+            H, 7   * $SECONDS_IN_DAY,
+            M, 60  * $SECONDS_IN_DAY,
+            L, 180 * $SECONDS_IN_DAY,
+            N, 0
+            },
+        },
+    "ies",
+        {
+        "name", "Inter-Enterprise Services",
+        "schedule",
+            {
+            H, 30  * $SECONDS_IN_DAY,
+            M, 90  * $SECONDS_IN_DAY,
+            L, 360 * $SECONDS_IN_DAY,
+            N, 0
+            }
+        },
+    "other",
+        {
+        "name", "All Production Systems and Network Infrastructure Components",
+        "schedule",
+            {
+            H, 60  * $SECONDS_IN_DAY,
+            M, 90  * $SECONDS_IN_DAY,
+            L, 360 * $SECONDS_IN_DAY,
+            N, 0
+            }
+        },
+    "non-prod",
+        {
+        "name", "All Other Multi-User Systems",
+        "schedule",
+            {
+            H, 90  * $SECONDS_IN_DAY,
+            M, 0,
+            L, 0,
+            N, 0
+            }
+        },
+    );
+
+$SYSTEM_TYPE{ 'non-prod' }{ 'schedule' }{ 'H' } = 180 * $SECONDS_IN_DAY
+  if ( $Config{ 'osname' } eq "aix" );
+
+require "$CONFIG_DIR/lssecfixes.cfg" if ( -f "$CONFIG_DIR/lssecfixes.cfg" );
+require "$BASEDIR/lssecfixes.cfg" if ( -f "$BASEDIR/lssecfixes.cfg" );
+
+$SECFIXDB_SERVER = $opts{ 'S' } if ( exists( $opts{ 'S' } ) );
+$SECFIXDB_USER = $opts{ 'U' } if ( exists( $opts{ 'U' } ) );
+$SECFIXDB_PASSWD = $opts{ 'P' } if ( exists( $opts{ 'P' } ) );
+$SECFIXDB_PATH = $opts{ 'D' } if ( exists( $opts{ 'D' } ) );
+
+$DATE_FORMAT = $opts{ 'T' } if ( exists( $opts{ 'T' } ) );
+
+$REPORT_VERSION = substr( $opts{ 'v' }, 0, 3 ) if ( exists( $opts{ 'v' } ) );
+
+$ENV{ PATH } = "/bin:/usr/bin:/sbin:/usr/sbin:/etc" ;
+$ENV{ IFS } = ' ' ;
+$ENV{ 'UNIX95' } = "yes";
+umask( 022 );
+
+if( exists $opts{ 'c' } )
+  {
+  $envFile = $opts{ 'c' };
+  }
+elsif( -e '/.ws/config/env' )
+  {
+  $envFile = "/.ws/config/env"
+  }
+else
+  {
+  $envFile = "/etc/env.cfg"
+  }
+
+if ( exists( $opts{ 's' } ) )
+  {
+  $securityClass = lc( $opts{ 's' } );
+  }
+else
+  {
+  $securityClass = getSecurityClass();
+  }
+
+die( "Unrecognized security class: $securityClass\nPossible values are: " . join( ", ", keys( %SYSTEM_TYPE ) ) . "\n" )
+  if ( ! grep( /^$securityClass$/, keys( %SYSTEM_TYPE ) ) );
+
+## check that the system commands are executable
+#
+foreach my $command ( keys( %COMMANDS ) )
+  {
+  die( "command: $COMMANDS{ $command } is not available.\n" )
+    if ( $command ne "emgr" && ! -x $COMMANDS{ $command } );
+  }
+
+
+&getFixDB();
+
+die( "Operating system not supported: $Config{ 'osname' }\n" ) if ( ! defined( &{ "readFixDB_" . $Config{ 'osname' } } ) );
+&{ "readFixDB_" . $Config{ 'osname' } }();
+
+if ( exists( $opts{ 'i' } ) )
+  {
+  ## If -i option is invoked, skip right to printing security fix info.
+  #
+  &printInfo();
+  }
+else
+  {
+  ## Gather data and report
+  #
+  if ( $Config{ 'osname' } ne "aix" || $REPORT_VERSION eq $MY_VERSION )
+    {
+    &checkRoot();
+    &{ "getInstalledSoftware_" . $Config{ 'osname' } }();
+    &{ "checkInstallationStatus_" . $Config{ 'osname' } }();
+    }
+
+  &{ "report_" . $Config{ 'osname' } }();
+  }
+
