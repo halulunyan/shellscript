@@ -1,0 +1,6 @@
+hostname,serialno,defaultgw,nic0,nic1
+atw150,UUID,Iデフォゲ,NIC_IP,NIC_IP
+atw160,UUID,Iデフォゲ,NIC_IP,NIC_IP
+atw170,UUID,Iデフォゲ,NIC_IP,NIC_IP
+atw180,UUID,Iデフォゲ,NIC_IP,NIC_IP
+atw190,UUID,Iデフォゲ,NIC_IP,NIC_IP
