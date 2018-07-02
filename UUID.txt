@@ -1,0 +1,1 @@
+dmidecode | grep UUID | awk 'BEGIN { FS=": "; } { print ; }' | sed -e "s/-//g"
